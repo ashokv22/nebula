@@ -1,22 +1,25 @@
 import unittest
 import asyncio
 from unittest.mock import AsyncMock, patch
-import main
+from fastapi import HTTPException
+
+from core import config, security
+from lens import analyzer, parser, router, schemas, service
 
 class InvestigatorTests(unittest.TestCase):
     def entry(self, message, level='ERROR'):
-        return main.parse_entry('1791887394971000000', f'2026-10-13 10:29:54.971 [worker-1] {level} [pH8NUNKM,super_admin] [123] --- x.y.Logger : {message}')
+        return parser.parse_entry('1791887394971000000', f'2026-10-13 10:29:54.971 [worker-1] {level} [pH8NUNKM,super_admin] [123] --- x.y.Logger : {message}')
     def test_exception(self):
         entry=self.entry('User got a com.foo.ProgramException while accessing /x\ncom.foo.ProgramException: Invalid Status response from KaleidoFIN\n\tat Foo.java:803')
         self.assertEqual(entry['exception'],'com.foo.ProgramException')
-        event, exception=main.request_event(entry,'pH8NUNKM',1)
+        event, exception=parser.request_event(entry,'pH8NUNKM',1)
         self.assertEqual(event['eventType'],'EXCEPTION')
         self.assertEqual(exception['message'],'Invalid Status response from KaleidoFIN')
         self.assertEqual(exception['stackTrace'],entry['message'])
     def test_advice_prefixed_exception(self):
         message='GlobalExceptionHandlingControllerAdvice: com.sensei.dcborigination.exception.ProgramException: Invalid Status response from KaleidoFIN\n\tat Foo.java:803'
         entry=self.entry(message)
-        event, exception=main.request_event(entry,'pH8NUNKM',1)
+        event, exception=parser.request_event(entry,'pH8NUNKM',1)
         self.assertEqual(entry['exception'],'com.sensei.dcborigination.exception.ProgramException')
         self.assertEqual(event['eventType'],'EXCEPTION')
         self.assertEqual(exception['message'],'Invalid Status response from KaleidoFIN')
@@ -31,16 +34,16 @@ class InvestigatorTests(unittest.TestCase):
         self.assertEqual(entry['timestamp'],'2026-10-13T10:29:54.971000+00:00')
     def test_end_fallback(self):
         entry=self.entry('REQ END | method=POST | uri=/api/test | status=500 | duration=20ms','INFO')
-        result=main.build_user_activity([entry],'super_admin',100)
+        result=service.build_user_activity([entry],'super_admin',100)
         self.assertEqual(result['requests'][0]['method'],'POST')
         self.assertEqual(result['requests'][0]['uri'],'/api/test')
     def test_redaction(self):
-        self.assertNotIn('1234567890',main.redact_sensitive_text('{"mobileNo":"1234567890"}'))
+        self.assertNotIn('1234567890',security.redact_sensitive_text('{"mobileNo":"1234567890"}'))
     def test_request_event_keeps_large_log_preview_safe(self):
         message='{"payload":"' + ('x' * 450) + '","mobileNo":"1234567890"}'
         entry=self.entry(message,'INFO')
-        entry=main.redact_request_entry(entry)
-        event, exception=main.request_event(entry,'pH8NUNKM',1)
+        entry=security.redact_request_entry(entry)
+        event, exception=parser.request_event(entry,'pH8NUNKM',1)
         self.assertIsNone(exception)
         self.assertEqual(event['eventType'],'APPLICATION_LOG')
         self.assertLessEqual(len(event['message']),300)
@@ -48,8 +51,8 @@ class InvestigatorTests(unittest.TestCase):
         self.assertNotIn('1234567890',event['message'])
     def test_request_timeline_keeps_legacy_fields_and_safe_structured_events(self):
         entry=self.entry('{"mobileNo":"1234567890","payload":"' + ('x' * 400) + '"}','INFO')
-        with patch('main.loki_query',new=AsyncMock(return_value=[entry])):
-            response=asyncio.run(main.request_timeline('pH8NUNKM'))
+        with patch('lens.router.loki_query',new=AsyncMock(return_value=[entry])):
+            response=asyncio.run(router.request_timeline('pH8NUNKM'))
         self.assertTrue({'request_id','environment','count','truncated_possible','start','end','errors','timeline'} <= response.keys())
         self.assertIn('raw',response['timeline'][0])
         self.assertNotIn('1234567890',response['timeline'][0]['raw'])
@@ -67,17 +70,29 @@ class InvestigatorTests(unittest.TestCase):
                 '\tat com.example.Service.call(Service.java:42)\n'
                 '\tat com.example.Service.call(Service.java:42)\n'
                 'webhook payload: ' + ('x' * 800))
-        context, indices = main.build_analysis_context(text=text)
+        context, indices = analyzer.build_analysis_context(text=text)
         self.assertNotIn('secret-token-value', context)
         self.assertNotIn('Signature=hidden', context)
         self.assertNotIn('9876543210', context)
         self.assertNotIn('user@example.com', context)
-        self.assertNotIn('DEBUG routine detail', context)
+        self.assertIn('DEBUG routine detail', context)
         self.assertNotIn('x' * 100, context)
         self.assertEqual(indices, set())
-        self.assertIn('[MOBILE]', context)
+        self.assertIn('mobile=[REDACTED]', context)
         self.assertIn('Service.java:42', context)
-        payload_context, _ = main.build_analysis_context(
+        structured_context, _ = analyzer.build_analysis_context(investigation={
+            'request': {},
+            'events': [
+                {'eventId': 'event-1', 'level': 'DEBUG', 'message': 'DEBUG structured detail'},
+                {'eventId': 'event-2', 'level': 'TRACE', 'message': 'TRACE structured detail'},
+                {'eventId': 'event-3', 'level': 'INFO', 'message': 'INFO structured detail'},
+            ],
+            'exceptions': [],
+        })
+        self.assertNotIn('DEBUG structured detail', structured_context)
+        self.assertNotIn('TRACE structured detail', structured_context)
+        self.assertIn('INFO structured detail', structured_context)
+        payload_context, _ = analyzer.build_analysis_context(
             text='webhook payload status=502 error=upstream down requestBody=' + ('x' * 800)
         )
         self.assertIn('status=502', payload_context)
@@ -91,13 +106,13 @@ class InvestigatorTests(unittest.TestCase):
                  'Caused by: java.net.SocketTimeoutException: Read timed out\n'
                  '\tat java.base/sun.nio.Socket.read(Socket.java:40)\n'
                  '\tat java.base/sun.nio.Socket.read(Socket.java:40)')
-        result = main._truncate_stack(stack)
+        result = analyzer._truncate_stack(stack)
         self.assertIn('com.sensei.RequestException: request failed', result)
         self.assertIn('Caused by: java.net.SocketTimeoutException: Read timed out', result)
         self.assertIn('RequestService.java:20', result)
         self.assertEqual(result.count('Socket.read(Socket.java:40)'), 1)
         self.assertLessEqual(result.count('at org.springframework'), 1)
-        capped = main._truncate_stack(stack, 100)
+        capped = analyzer._truncate_stack(stack, 100)
         self.assertLessEqual(len(capped), 100)
         self.assertIn('SocketTimeoutException', capped)
     def test_analysis_context_keeps_late_failure_with_event_budget(self):
@@ -107,9 +122,9 @@ class InvestigatorTests(unittest.TestCase):
         events[-1]['message'] = 'REQ END | method=POST | uri=/api/test | status=500'
         events.append({'eventId': 'event-46', 'level': 'ERROR', 'message': 'Late failure after retries'})
         investigation = {'request': {'requestId': 'test1234'}, 'events': events, 'exceptions': []}
-        context, indices = main.build_analysis_context(investigation=investigation)
+        context, indices = analyzer.build_analysis_context(investigation=investigation)
         parsed = __import__('json').loads(context)
-        self.assertLessEqual(len(parsed['events']), main.ANALYSIS_MAX_EVENTS)
+        self.assertLessEqual(len(parsed['events']), config.ANALYSIS_MAX_EVENTS)
         self.assertIn(46, indices)
         self.assertEqual([item['eventIndex'] for item in parsed['events']],
                          sorted(item['eventIndex'] for item in parsed['events']))
@@ -118,13 +133,13 @@ class InvestigatorTests(unittest.TestCase):
     def test_payload_filter_keeps_only_business_failure_facts(self):
         huge_response = ('getLoanStatus response: {"errorCode":"ER021",'
                          '"message":"Loan status lookup rejected","payload":"' + ('x' * 1200) + '"}')
-        reduced = main._reduce_payload_noise(huge_response)
+        reduced = analyzer._reduce_payload_noise(huge_response)
         self.assertIn('ER021', reduced)
         self.assertIn('Loan status lookup rejected', reduced)
         self.assertNotIn('x' * 100, reduced)
-        self.assertIsNone(main._reduce_payload_noise('webhook payload: ' + ('x' * 1200)))
+        self.assertIsNone(analyzer._reduce_payload_noise('webhook payload: ' + ('x' * 1200)))
     def test_analysis_context_keeps_normal_request_without_errors(self):
-        context, indices = main.build_analysis_context(
+        context, indices = analyzer.build_analysis_context(
             text='REQ START | method=GET | uri=/api/status\nINFO request completed normally\n'
                  'REQ END | method=GET | uri=/api/status | status=200')
         self.assertIn('request completed normally', context)
@@ -136,13 +151,13 @@ class InvestigatorTests(unittest.TestCase):
               'cookie=SESSION=inline-session; other=inline-cookie\n'
                   'pan=ABCDE1234F aadhaar=1234 5678 9012 mobile=9876543210 '
                   'email=person@example.com')
-        result = main.redact_analysis_text(source)
+        result = security.redact_analysis_text(source)
         for sensitive in ('secret-value', 'secret-session', 'secret-cookie', 'inline-session',
                   'inline-cookie', 'ABCDE1234F',
                           '1234 5678 9012', '9876543210', 'person@example.com'):
             self.assertNotIn(sensitive, result)
     def test_analysis_item_normalization_only_removes_real_list_prefixes(self):
-        normalized = main.normalize_analysis_items([
+        normalized = analyzer.normalize_analysis_items([
             '1. Check service mapping\n2) "Verify downstream status"',
             '- Preserve -value exactly\n\u2022 Check request completion',
             '3.14 release behavior\n"Quoted item"\n   ',
@@ -153,19 +168,18 @@ class InvestigatorTests(unittest.TestCase):
             '3.14 release behavior', 'Quoted item',
         ])
     def test_analysis_prompt_sets_evidence_and_http_constraints(self):
-        instructions = ' '.join(main.ANALYSIS_SYSTEM_INSTRUCTIONS.split())
-        self.assertIn('An "not found" lookup does not prove a database record is missing', instructions)
-        self.assertIn('HTTP 200 does not prove every internal operation succeeded', instructions)
-        self.assertIn('An ERROR log alone does not prove the overall request failed', instructions)
-        self.assertIn('HIGH requires strong, direct evidence', instructions)
+        instructions = ' '.join(config.ANALYSIS_SYSTEM_INSTRUCTIONS.split())
+        self.assertIn('Do not infer database, frontend, network, or configuration problems without evidence', instructions)
+        self.assertIn('HTTP 200 does not guarantee internal success; ERROR does not imply HTTP failure', instructions)
+        self.assertIn('HIGH requires direct evidence', instructions)
         self.assertIn('Reference only supplied event indices', instructions)
     def test_analysis_rejects_conflicting_inputs_without_groq_call(self):
         with (
             patch.dict('os.environ', {'API_TOKEN': 'test-token'}),
-            patch('main.call_groq', new=AsyncMock()) as groq,
+            patch('lens.router.call_groq', new=AsyncMock()) as groq,
         ):
-            with self.assertRaises(main.HTTPException) as raised:
-                asyncio.run(main.analyze_request(main.AnalyzeRequest(requestId='pH8NUNKM', text='log')))
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(router.analyze_request(schemas.AnalyzeRequest(requestId='pH8NUNKM', text='log')))
         self.assertEqual(raised.exception.status_code, 400)
         groq.assert_not_awaited()
     def test_analysis_request_id_cache_uses_fingerprint(self):
@@ -184,44 +198,44 @@ class InvestigatorTests(unittest.TestCase):
             'summary': 'External call failed', 'likelyCause': 'The upstream returned HTTP 502',
             'confidence': 'medium', 'evidence': [{'eventIndex': 2, 'description': 'Upstream status 502'}],
             'suggestedChecks': ['Inspect upstream availability'], 'limitations': [],
-            'model': main.GROQ_MODEL,
+            'model': config.GROQ_MODEL,
         }
-        main.ANALYSIS_CACHE.clear()
+        config.ANALYSIS_CACHE.clear()
         with (
             patch.dict('os.environ', {'API_TOKEN': 'test-token'}),
-            patch('main.request_timeline', new=AsyncMock(return_value=investigation)),
-            patch('main.call_groq', new=AsyncMock(return_value=response)) as groq,
+            patch('lens.router.request_timeline', new=AsyncMock(return_value=investigation)),
+            patch('lens.router.call_groq', new=AsyncMock(return_value=response)) as groq,
         ):
-            first = asyncio.run(main.analyze_request(main.AnalyzeRequest(requestId='pH8NUNKM')))
-            second = asyncio.run(main.analyze_request(main.AnalyzeRequest(requestId='pH8NUNKM')))
+            first = asyncio.run(router.analyze_request(schemas.AnalyzeRequest(requestId='pH8NUNKM')))
+            second = asyncio.run(router.analyze_request(schemas.AnalyzeRequest(requestId='pH8NUNKM')))
         self.assertEqual(first, second)
         groq.assert_awaited_once()
         self.assertEqual(first['evidence'][0]['eventIndex'], 2)
-        main.ANALYSIS_CACHE.clear()
+        config.ANALYSIS_CACHE.clear()
     def test_prod_environment_is_used_by_all_log_apis(self):
-        self.assertEqual(main.selector_for_environment('prod'), '{env="prod",app="prod"}')
-        with patch('main.loki_query', new=AsyncMock(return_value=[])) as loki:
-            timeline = asyncio.run(main.request_timeline('pH8NUNKM', environment='prod'))
+        self.assertEqual(config.selector_for_environment('prod'), '{env="prod",app="prod"}')
+        with patch('lens.router.loki_query', new=AsyncMock(return_value=[])) as loki:
+            timeline = asyncio.run(router.request_timeline('pH8NUNKM', environment='prod'))
         self.assertEqual(timeline['environment'], 'prod')
         self.assertIn('{env="prod",app="prod"}', loki.await_args.args[0])
 
-        with patch('main.loki_query', new=AsyncMock(return_value=[])) as loki:
-            activity = asyncio.run(main.user_activity('some-user', environment='prod'))
+        with patch('lens.router.loki_query', new=AsyncMock(return_value=[])) as loki:
+            activity = asyncio.run(router.user_activity('some-user', environment='prod'))
         self.assertEqual(activity['environment'], 'prod')
         self.assertIn('{env="prod",app="prod"}', loki.await_args.args[0])
 
-        with patch('main.loki_query', new=AsyncMock(return_value=[])) as loki:
-            errors = asyncio.run(main.recent_errors(environment='prod'))
+        with patch('lens.router.loki_query', new=AsyncMock(return_value=[])) as loki:
+            errors = asyncio.run(router.recent_errors(environment='prod'))
         self.assertEqual(errors['environment'], 'prod')
         self.assertIn('{env="prod",app="prod"}', loki.await_args.args[0])
 
         with (
             patch.dict('os.environ', {'API_TOKEN': 'test-token'}),
-            patch('main.request_timeline', new=AsyncMock(return_value={'count': 0})) as timeline,
+            patch('lens.router.request_timeline', new=AsyncMock(return_value={'count': 0})) as timeline,
         ):
-            with self.assertRaises(main.HTTPException):
-                asyncio.run(main.analyze_request(
-                    main.AnalyzeRequest(requestId='pH8NUNKM'), environment='prod'
+            with self.assertRaises(HTTPException):
+                asyncio.run(router.analyze_request(
+                    schemas.AnalyzeRequest(requestId='pH8NUNKM'), environment='prod'
                 ))
         self.assertEqual(timeline.await_args.kwargs['environment'], 'prod')
 
