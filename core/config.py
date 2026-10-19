@@ -30,15 +30,8 @@ Output:
 - suggestedChecks: Up to 3 distinct, actionable checks, one per array item.
 - limitations: Meaningful uncertainties only, or [].
 - Keep responses concise, avoid repetition, and return only the required JSON.
-Output:
-- summary: Observed failure and HTTP outcome, without speculation.
-- likelyCause: Best-supported explanation; acknowledge uncertainty.
-- evidence: Relevant event references only.
-- suggestedChecks: Up to 3 distinct, actionable checks, one per array item.
-- limitations: Meaningful uncertainties only, or [].
-- Keep responses concise, avoid repetition, and return only the required JSON.
 - Always include every required JSON field, using [] for empty arrays
-	and a concise uncertainty statement when the cause is unknown.
+  and a concise uncertainty statement when the cause is unknown.
 """
 
 ANALYSIS_CACHE: dict[tuple[str, str], dict] = {}
