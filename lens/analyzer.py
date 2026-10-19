@@ -329,7 +329,7 @@ async def call_groq(context: str, valid_indices: set[int], free_text: bool) -> d
         ],
         "response_format": {"type": "json_schema", "json_schema": _groq_json_schema()},
         "reasoning_effort": "low",
-        "max_completion_tokens": 00,
+        "max_completion_tokens": 1500,
     }
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
