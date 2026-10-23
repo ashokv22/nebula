@@ -1,6 +1,5 @@
 import hashlib
 import json
-import logging
 import math
 import re
 import time
@@ -15,11 +14,10 @@ from core.security import (
     EXTERNAL_AI,
     redact_lead_evidence_text,
 )
+from lens.analyzer import _lead_ai_diagnostic
 from lens.loki import loki_query
 from lens.parser import extract_request_id, request_entry_matches
 from lens.schemas import LeadIntelligenceModel
-
-logger = logging.getLogger(__name__)
 
 LEAD_ALIASES = ("leadId", "applicantId", "applicationId", "partnerLoanId")
 LEAD_FIELD = re.compile(
@@ -57,10 +55,15 @@ ACTION_CONTEXT = {
 
 
 def _log_lead_analysis_rejection(stage: str, reason: str, **details) -> None:
-    logger.warning(
-        "Lead Intelligence analysis validation failed",
-        extra={"lead_ai_validation": {"stage": stage, "reason": reason, **details}},
+    suggested_check_failure = stage == "suggested_check_validation"
+    _lead_ai_diagnostic(
+        "suggested_check_validation" if suggested_check_failure else "evidence_reference_validation",
+        invalid_reference_count=details.get("invalid_reference_count"),
+        invalid_suggested_check_count=1 if suggested_check_failure else None,
+        validation_reason=reason,
     )
+
+
 EVENT_CATEGORY_PRIORITY = {
     "FAILURE": 100,
     "STAGE_TRANSITION": 80,

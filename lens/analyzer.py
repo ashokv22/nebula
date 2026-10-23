@@ -37,12 +37,50 @@ _GROQ_ERROR_CATEGORIES = frozenset({
     "rate_limit_exceeded", "server_error", "insufficient_quota",
     "context_length_exceeded", "model_not_found",
 })
+_DIAGNOSTIC_STAGES = frozenset({
+    "completion_extraction", "json_parsing", "pydantic_validation",
+    "evidence_reference_validation", "suggested_check_validation",
+})
+_DIAGNOSTIC_REASONS = frozenset({
+    "missing_references", "unknown_reference",
+    "ambiguous_identifier_correlation", "unknown_summary_or_stage_reference",
+    "request_id_not_in_evidence", "username_not_in_evidence", "schema_validation",
+})
 
 
 def _lead_ai_diagnostic(stage: str, **details) -> None:
+    fields = {"stage": stage if stage in _DIAGNOSTIC_STAGES else "completion_extraction"}
+    for key in ("http_status", "prompt_tokens", "completion_tokens", "total_tokens",
+                "line", "column", "position", "invalid_reference_count",
+                "invalid_suggested_check_count"):
+        value = details.get(key)
+        if type(value) is int and 0 <= value <= 1_000_000:
+            fields[key] = value
+    for key in ("provider_error_category", "finish_reason", "error_type",
+                "validation_reason"):
+        value = details.get(key)
+        allowed = (
+            _GROQ_ERROR_CATEGORIES | {"none", "other", "unclassified"}
+            if key == "provider_error_category" else
+            {"stop", "length", "tool_calls", "content_filter", "function_call", "other"}
+            if key == "finish_reason" else
+            {"JSONDecodeError", "ValidationError", "KeyError", "IndexError", "TypeError"}
+            if key == "error_type" else _DIAGNOSTIC_REASONS
+        )
+        if isinstance(value, str) and value in allowed:
+            fields[key] = value
+    for key in ("field_paths", "error_types"):
+        value = details.get(key)
+        if isinstance(value, list):
+            fields[key] = [
+                item[:160] for item in value[:20]
+                if isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9_.<>-]{1,160}", item)
+            ]
+    encoded = json.dumps(fields, ensure_ascii=True, separators=(",", ":"))
     logger.warning(
-        "Lead Intelligence AI diagnostic",
-        extra={"lead_ai_diagnostic": {"stage": stage, **details}},
+        "Lead Intelligence AI diagnostic %s",
+        encoded,
+        extra={"lead_ai_diagnostic": fields},
     )
 
 
@@ -92,16 +130,6 @@ def _validation_diagnostics(exc: ValidationError) -> tuple[list[str], list[str],
         if parts and parts[0] == "suggestedChecks":
             suggested_errors += 1
     return paths, types, suggested_errors
-
-
-def _json_error_category(exc: json.JSONDecodeError) -> str:
-    if exc.msg == "Extra data":
-        return "extra_data"
-    if exc.msg.startswith("Unterminated"):
-        return "unterminated_value"
-    if exc.msg.startswith("Expecting"):
-        return "incomplete_or_invalid_value"
-    return "invalid_json"
 
 
 def normalize_analysis_items(items: list[str]) -> list[str]:
@@ -505,10 +533,12 @@ async def call_lead_groq(context: str) -> dict:
                 data = response.json()
             except json.JSONDecodeError as exc:
                 _lead_ai_diagnostic(
-                    "provider_envelope_json",
+                    "json_parsing",
                     http_status=response.status_code,
                     provider_error_category="none",
-                    category=_json_error_category(exc),
+                    error_type="JSONDecodeError",
+                    line=exc.lineno,
+                    column=exc.colno,
                     position=exc.pos,
                 )
                 raise HTTPException(
@@ -516,11 +546,11 @@ async def call_lead_groq(context: str) -> dict:
                     detail="Groq returned invalid Lead Intelligence",
                 ) from exc
     except httpx.TimeoutException as exc:
-        _lead_ai_diagnostic("provider_transport", reason="timeout")
+        _lead_ai_diagnostic("completion_extraction")
         raise HTTPException(status_code=504, detail="Groq analysis timed out") from exc
     except httpx.HTTPStatusError as exc:
         _lead_ai_diagnostic(
-            "provider_http_error",
+            "completion_extraction",
             http_status=exc.response.status_code,
             provider_error_category=_provider_error_category(exc.response),
         )
@@ -529,7 +559,7 @@ async def call_lead_groq(context: str) -> dict:
             detail=f"Groq analysis failed with HTTP {exc.response.status_code}",
         ) from exc
     except (httpx.HTTPError, ValueError) as exc:
-        _lead_ai_diagnostic("provider_transport", reason=type(exc).__name__)
+        _lead_ai_diagnostic("completion_extraction")
         raise HTTPException(status_code=502, detail="Groq analysis request failed") from exc
     metadata = _completion_metadata(
         data if isinstance(data, dict) else {},
@@ -539,25 +569,27 @@ async def call_lead_groq(context: str) -> dict:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         _lead_ai_diagnostic(
-            "completion_shape",
+            "completion_extraction",
             **metadata,
-            reason=type(exc).__name__,
+            error_type=type(exc).__name__,
         )
         raise HTTPException(status_code=502, detail="Groq returned invalid Lead Intelligence") from exc
     if not isinstance(content, str):
         _lead_ai_diagnostic(
-            "completion_content",
+            "completion_extraction",
             **metadata,
-            reason="non_string_content",
+            error_type="TypeError",
         )
         raise HTTPException(status_code=502, detail="Groq returned invalid Lead Intelligence")
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as exc:
         _lead_ai_diagnostic(
-            "json_parse",
+            "json_parsing",
             **metadata,
-            category=_json_error_category(exc),
+            error_type="JSONDecodeError",
+            line=exc.lineno,
+            column=exc.colno,
             position=exc.pos,
         )
         raise HTTPException(status_code=502, detail="Groq returned invalid Lead Intelligence") from exc
@@ -570,6 +602,7 @@ async def call_lead_groq(context: str) -> dict:
             **metadata,
             field_paths=paths,
             error_types=error_types,
-            invalid_suggested_checks=suggested_errors,
+            invalid_suggested_check_count=suggested_errors,
+            validation_reason="schema_validation" if suggested_errors else None,
         )
         raise HTTPException(status_code=502, detail="Groq returned invalid Lead Intelligence") from exc

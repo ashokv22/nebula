@@ -69,9 +69,14 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 502)
         self.assertEqual(raised.exception.detail, "Groq returned invalid Lead Intelligence")
         diagnostic = captured.records[0].lead_ai_diagnostic
+        formatted_message = captured.records[0].getMessage()
+        self.assertIn('"stage":"pydantic_validation"', formatted_message)
+        self.assertIn('"finish_reason":"length"', formatted_message)
+        self.assertIn('"total_tokens":200', formatted_message)
+        self.assertNotIn(unsafe_value, formatted_message)
         self.assertEqual(diagnostic["stage"], "pydantic_validation")
         self.assertIn("suggestedChecks.0.action", diagnostic["field_paths"])
-        self.assertEqual(diagnostic["invalid_suggested_checks"], 1)
+        self.assertEqual(diagnostic["invalid_suggested_check_count"], 1)
         self.assertEqual(diagnostic["finish_reason"], "length")
         self.assertEqual(diagnostic["total_tokens"], 200)
         self.assertNotIn(unsafe_value, str(diagnostic))
@@ -84,8 +89,12 @@ class LeadIntelligenceTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 502)
         diagnostic = captured.records[0].lead_ai_diagnostic
-        self.assertEqual(diagnostic["stage"], "json_parse")
-        self.assertEqual(diagnostic["category"], "unterminated_value")
+        formatted_message = captured.records[0].getMessage()
+        self.assertIn('"stage":"json_parsing"', formatted_message)
+        self.assertIn('"line":', formatted_message)
+        self.assertIn('"column":', formatted_message)
+        self.assertEqual(diagnostic["stage"], "json_parsing")
+        self.assertEqual(diagnostic["error_type"], "JSONDecodeError")
         self.assertGreater(diagnostic["position"], 0)
         self.assertNotIn(private_marker, str(diagnostic))
 
@@ -712,13 +721,15 @@ class LeadIntelligenceTests(unittest.TestCase):
         })
 
         base["suggestedChecks"][0]["evidenceRefs"] = []
-        with self.assertLogs("lens.lead_service", level="WARNING") as captured:
+        with self.assertLogs("lens.analyzer", level="WARNING") as captured:
             with self.assertRaises(HTTPException) as raised:
                 lead_service.validate_lead_analysis(base, investigation, {"evidence-1"})
         self.assertEqual(raised.exception.status_code, 502)
-        diagnostic = captured.records[0].lead_ai_validation
+        message = captured.records[0].getMessage()
+        self.assertIn('"stage":"evidence_reference_validation"', message)
+        diagnostic = json.loads(message.split(" diagnostic ", 1)[1])
         self.assertEqual(diagnostic["stage"], "evidence_reference_validation")
-        self.assertEqual(diagnostic["reason"], "missing_references")
+        self.assertEqual(diagnostic["validation_reason"], "missing_references")
         self.assertEqual(diagnostic["invalid_reference_count"], 0)
 
     def test_ai_claim_cannot_combine_ambiguous_alias_groups(self):
