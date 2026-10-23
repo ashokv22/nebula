@@ -8,9 +8,10 @@ from lens.parser import parse_entry
 
 
 async def loki_query(query: str, minutes: int, limit: int, direction: str = "BACKWARD",
-                     window_end: datetime | None = None) -> list[dict]:
+                     window_end: datetime | None = None,
+                     window_start: datetime | None = None) -> list[dict]:
     end = window_end or datetime.now(timezone.utc)
-    start = end - timedelta(minutes=minutes)
+    start = window_start or end - timedelta(minutes=minutes)
     params = {"query": query, "start": str(int(start.timestamp() * 1_000_000_000)),
               "end": str(int(end.timestamp() * 1_000_000_000)), "limit": limit,
               "direction": direction}

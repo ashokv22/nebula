@@ -13,11 +13,27 @@ from core.config import (
     LOKI_URL,
     selector_for_environment,
 )
-from core.security import EMAIL_DOMAIN, authorize_request_investigation, redact_request_entry
-from lens.analyzer import build_analysis_context, call_groq
+from core import config
+from core.security import (
+    EMAIL_DOMAIN,
+    authorize_environment_access,
+    authorize_request_investigation,
+    redact_request_entry,
+)
+from lens.analyzer import build_analysis_context, call_groq, call_lead_groq
+from lens.lead_service import (
+    build_lead_ai_context,
+    investigate_lead,
+    validate_lead_analysis,
+)
 from lens.loki import loki_query
 from lens.parser import request_entry_matches
-from lens.schemas import AnalysisResponse, AnalyzeRequest
+from lens.schemas import (
+    AnalysisResponse,
+    AnalyzeRequest,
+    LeadIntelligenceResponse,
+    LeadInvestigationResponse,
+)
 from lens.service import (
     build_request_investigation,
     build_user_activity,
@@ -26,6 +42,63 @@ from lens.service import (
 )
 
 router = APIRouter()
+
+
+@router.get("/leads/{lead_id}/investigation", response_model=LeadInvestigationResponse)
+async def lead_investigation(
+    lead_id: str,
+    days: Annotated[int, Query(ge=1, le=30)] = 7,
+    access_token: Annotated[str | None, Header(alias="X-Request-Investigation-Token")] = None,
+    environment: Annotated[Literal["uat", "prod"], Query(alias="env")] = "uat",
+):
+    authorize_environment_access(access_token, environment)
+    return await investigate_lead(lead_id, environment, days)
+
+
+@router.post("/leads/{lead_id}/analyze", response_model=LeadIntelligenceResponse)
+async def analyze_lead(
+    lead_id: str,
+    days: Annotated[int, Query(ge=1, le=30)] = 7,
+    access_token: Annotated[str | None, Header(alias="X-Request-Investigation-Token")] = None,
+    environment: Annotated[Literal["uat", "prod"], Query(alias="env")] = "uat",
+):
+    authorize_environment_access(access_token, environment)
+    if environment == "prod" and not config.ALLOW_PROD_AI:
+        raise HTTPException(
+            status_code=403,
+            detail="AI analysis of Production logs is disabled by server configuration",
+        )
+    if not os.getenv("API_TOKEN"):
+        raise HTTPException(status_code=503, detail="AI analysis is unavailable: API_TOKEN is not configured")
+    investigation = await investigate_lead(lead_id, environment, days)
+    if not investigation["evidence"]:
+        return {
+            "leadSummary": {
+                "narrative": "No exact lead-identifier field matches were found in the searched logs.",
+                "latestObservedActivity": None,
+                "latestActivityEvidence": [],
+                "currentStage": None,
+                "stageEvidence": [],
+                "confidence": "low",
+            },
+            "journeyTimeline": [],
+            "findingsAndAnomalies": [],
+            "rootCauseAssessment": {
+                "observedFacts": [],
+                "possibleCauses": [],
+                "confidence": "low",
+            },
+            "suggestedChecks": [],
+            "recommendedNextSteps": [],
+            "limitations": list(dict.fromkeys(
+                investigation["limitations"]
+                + ["Current stage could not be established from retrieved evidence."]
+            )),
+            "model": config.GROQ_MODEL,
+        }
+    context, valid_refs, context_truncated = build_lead_ai_context(investigation)
+    result = await call_lead_groq(context)
+    return validate_lead_analysis(result, investigation, valid_refs, context_truncated)
 
 
 @router.post("/analyze", response_model=AnalysisResponse)
@@ -38,6 +111,13 @@ async def analyze_request(
         raise HTTPException(status_code=400, detail="Provide either requestId or text, not both")
     if body.request_id is None and (body.text is None or not body.text.strip()):
         raise HTTPException(status_code=400, detail="Provide a non-empty requestId or text")
+    if environment == "prod":
+        authorize_environment_access(access_token, environment)
+        if not config.ALLOW_PROD_AI:
+            raise HTTPException(
+                status_code=403,
+                detail="AI analysis of Production logs is disabled by server configuration",
+            )
     if not os.getenv("API_TOKEN"):
         raise HTTPException(status_code=503, detail="AI analysis is unavailable: API_TOKEN is not configured")
 
@@ -84,7 +164,10 @@ async def request_timeline(
 ):
     if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", request_id):
         raise HTTPException(status_code=400, detail="Invalid request ID")
-    authorize_request_investigation(access_token)
+    if environment == "prod":
+        authorize_environment_access(access_token, environment)
+    else:
+        authorize_request_investigation(access_token)
     # Match MDC field rather than arbitrary message occurrences.
     query = selector_for_environment(environment) + f' |= "[{request_id},"'
     window_end = datetime.now(timezone.utc)
@@ -110,8 +193,11 @@ async def user_activity(
     user: str,
     minutes: Annotated[int, Query(ge=1, le=1440)] = 15,
     limit: Annotated[int, Query(ge=1, le=5000)] = 100,
+    access_token: Annotated[str | None, Header(alias="X-Request-Investigation-Token")] = None,
     environment: Annotated[Literal["uat", "prod"], Query(alias="env")] = "uat",
 ):
+    if environment == "prod":
+        authorize_environment_access(access_token, environment)
     normalized_username = normalize_username(user)
     if not normalized_username:
         raise HTTPException(status_code=400, detail="Username must not be empty")
@@ -130,8 +216,11 @@ async def recent_errors(
     exclude_auth: Annotated[bool, Query(alias="excludeAuth")] = False,
     user: str | None = None,
     exception: str | None = None,
+    access_token: Annotated[str | None, Header(alias="X-Request-Investigation-Token")] = None,
     environment: Annotated[Literal["uat", "prod"], Query(alias="env")] = "uat",
 ):
+    if environment == "prod":
+        authorize_environment_access(access_token, environment)
     selector = selector_for_environment(environment)
     entries = await loki_query(selector + ' |= "ERROR"', minutes, limit)
     errors = [e for e in entries if e["level"] == "ERROR"]

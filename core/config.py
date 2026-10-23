@@ -8,6 +8,13 @@ GROQ_MODEL = "openai/gpt-oss-20b"
 ANALYSIS_MAX_EVENTS = int(os.getenv("ANALYSIS_MAX_EVENTS", "40"))
 ANALYSIS_MAX_EVENT_CHARS = int(os.getenv("ANALYSIS_MAX_EVENT_CHARS", "900"))
 ANALYSIS_MAX_CONTEXT_CHARS = int(os.getenv("ANALYSIS_MAX_CONTEXT_CHARS", "12000"))
+LEAD_MAX_DAYS = int(os.getenv("LEAD_MAX_DAYS", "30"))
+LEAD_MAX_REQUEST_IDS = int(os.getenv("LEAD_MAX_REQUEST_IDS", "20"))
+LEAD_MAX_RETRIEVED_LINES = int(os.getenv("LEAD_MAX_RETRIEVED_LINES", "2000"))
+LEAD_LOKI_PAGE_SIZE = int(os.getenv("LEAD_LOKI_PAGE_SIZE", "500"))
+LEAD_MAX_LOKI_QUERIES = int(os.getenv("LEAD_MAX_LOKI_QUERIES", "120"))
+LEAD_AI_MAX_CONTEXT_CHARS = int(os.getenv("LEAD_AI_MAX_CONTEXT_CHARS", "10000"))
+ALLOW_PROD_AI = os.getenv("ALLOW_PROD_AI", "").strip().casefold() in {"1", "true", "yes"}
 
 ANALYSIS_SYSTEM_INSTRUCTIONS = """
 You are a Spring Boot log investigation assistant.

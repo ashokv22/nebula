@@ -145,12 +145,16 @@ def request_marker_metadata(entry: dict, marker: str) -> dict:
     return fields
 
 
-def request_entry_matches(entry: dict, request_id: str) -> bool:
-    if entry["request_id"] == request_id:
-        return True
+def extract_request_id(entry: dict) -> str | None:
+    if entry.get("request_id"):
+        return entry["request_id"]
     malformed_header = re.match(
         r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} \[[^]]+\] \S+\s+"
         r"\[(?P<request_id>[^,\]]+),",
         entry["raw"],
     )
-    return bool(malformed_header and malformed_header.group("request_id") == request_id)
+    return malformed_header.group("request_id") if malformed_header else None
+
+
+def request_entry_matches(entry: dict, request_id: str) -> bool:
+    return extract_request_id(entry) == request_id

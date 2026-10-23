@@ -214,28 +214,47 @@ class InvestigatorTests(unittest.TestCase):
         config.ANALYSIS_CACHE.clear()
     def test_prod_environment_is_used_by_all_log_apis(self):
         self.assertEqual(config.selector_for_environment('prod'), '{env="prod",app="prod"}')
-        with patch('lens.router.loki_query', new=AsyncMock(return_value=[])) as loki:
-            timeline = asyncio.run(router.request_timeline('pH8NUNKM', environment='prod'))
+        with (
+            patch('core.security.REQUEST_INVESTIGATION_TOKEN', 'prod-token'),
+            patch('lens.router.loki_query', new=AsyncMock(return_value=[])) as loki,
+        ):
+            timeline = asyncio.run(router.request_timeline(
+                'pH8NUNKM', access_token='prod-token', environment='prod'
+            ))
         self.assertEqual(timeline['environment'], 'prod')
         self.assertIn('{env="prod",app="prod"}', loki.await_args.args[0])
 
-        with patch('lens.router.loki_query', new=AsyncMock(return_value=[])) as loki:
-            activity = asyncio.run(router.user_activity('some-user', environment='prod'))
+        with (
+            patch('core.security.REQUEST_INVESTIGATION_TOKEN', 'prod-token'),
+            patch('lens.router.loki_query', new=AsyncMock(return_value=[])) as loki,
+        ):
+            activity = asyncio.run(router.user_activity(
+                'some-user', access_token='prod-token', environment='prod'
+            ))
         self.assertEqual(activity['environment'], 'prod')
         self.assertIn('{env="prod",app="prod"}', loki.await_args.args[0])
 
-        with patch('lens.router.loki_query', new=AsyncMock(return_value=[])) as loki:
-            errors = asyncio.run(router.recent_errors(environment='prod'))
+        with (
+            patch('core.security.REQUEST_INVESTIGATION_TOKEN', 'prod-token'),
+            patch('lens.router.loki_query', new=AsyncMock(return_value=[])) as loki,
+        ):
+            errors = asyncio.run(router.recent_errors(
+                access_token='prod-token', environment='prod'
+            ))
         self.assertEqual(errors['environment'], 'prod')
         self.assertIn('{env="prod",app="prod"}', loki.await_args.args[0])
 
         with (
+            patch('core.security.REQUEST_INVESTIGATION_TOKEN', 'prod-token'),
+            patch.object(config, 'ALLOW_PROD_AI', True),
             patch.dict('os.environ', {'API_TOKEN': 'test-token'}),
             patch('lens.router.request_timeline', new=AsyncMock(return_value={'count': 0})) as timeline,
         ):
             with self.assertRaises(HTTPException):
                 asyncio.run(router.analyze_request(
-                    schemas.AnalyzeRequest(requestId='pH8NUNKM'), environment='prod'
+                    schemas.AnalyzeRequest(requestId='pH8NUNKM'),
+                    access_token='prod-token',
+                    environment='prod',
                 ))
         self.assertEqual(timeline.await_args.kwargs['environment'], 'prod')
 

@@ -34,12 +34,15 @@ Docs: http://127.0.0.1:8000/docs
 
 Keep port 8000 bound to localhost unless the service is protected. Set
 `REQUEST_INVESTIGATION_TOKEN` to require the `X-Request-Investigation-Token`
-header on `/requests/{request_id}`. The detailed response retains request
-evidence with common password, token, secret, and authorization values redacted;
+header on `/requests/{request_id}` and the new Lead Intelligence endpoints.
+Production log endpoints fail closed unless this token is configured. The
+detailed response retains request evidence with common password, token, secret,
+and authorization values redacted;
 large application-log event messages are previews, with full redacted evidence
 available in the detailed `timeline` field.
 
-Loki range-query limit applies; a large result can be truncated. The current implementation does not paginate.
+Loki range-query limits apply to the existing request, user, and error endpoints;
+large result sets there can be truncated.
 
 Set `API_TOKEN` to enable Groq analysis. The service sends only a compact,
 redacted diagnostic context to `openai/gpt-oss-20b`; it does not alter the
@@ -51,3 +54,36 @@ send `"forceRefresh": true` to bypass the cache.
 For `/analyze` request-ID investigations, the optional
 `X-Request-Investigation-Token` header follows the same protection as the
 request timeline endpoint. `minutes` defaults to 60 and is limited to 1-1440.
+
+## Lead Intelligence
+
+The lead investigation endpoint searches exact `leadId`, `applicantId`,
+`applicationId`, and `partnerLoanId` field/value associations over a bounded
+Loki range, then correlates matching MDC request IDs with their request
+timelines. Matches from different identifier aliases remain candidates and
+are marked ambiguous when multiple aliases match; identifier equality alone
+does not confirm business identity.
+
+```bash
+curl -s 'http://127.0.0.1:8000/leads/12345/investigation?env=uat&days=7' \
+  -H 'X-Request-Investigation-Token: YOUR_TOKEN' | jq .
+curl -s -X POST \
+  'http://127.0.0.1:8000/leads/12345/analyze?env=uat&days=7' \
+  -H 'X-Request-Investigation-Token: YOUR_TOKEN' | jq .
+```
+
+Both endpoints require the configured investigation token when
+`REQUEST_INVESTIGATION_TOKEN` is set. `env` defaults to `uat`; Production
+investigation fails closed unless `REQUEST_INVESTIGATION_TOKEN` is configured,
+and Production log endpoints require that token. Production AI analysis is
+disabled unless the server explicitly sets `ALLOW_PROD_AI=true`.
+Before a Groq request, evidence is redacted and capped; no Groq request is
+made for an empty evidence set.
+
+Lead retrieval limits are configurable through `LEAD_MAX_DAYS` (30),
+`LEAD_MAX_REQUEST_IDS` (20), `LEAD_MAX_RETRIEVED_LINES` (2000),
+`LEAD_LOKI_PAGE_SIZE` (500), `LEAD_MAX_LOKI_QUERIES` (120), and
+`LEAD_AI_MAX_CONTEXT_CHARS` (10000). Range, pagination, request-ID, and AI
+context truncation are reflected in the response limitations and retrieval
+statistics. The query parameters accept `days` from 1 through 30; a lower
+`LEAD_MAX_DAYS` setting caps the searched window.

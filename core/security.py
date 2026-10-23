@@ -86,3 +86,12 @@ def authorize_request_investigation(token: str | None) -> None:
 		not token or not hmac.compare_digest(token, REQUEST_INVESTIGATION_TOKEN)
 	):
 		raise HTTPException(status_code=401, detail="Request investigation access denied")
+
+
+def authorize_environment_access(token: str | None, environment: str) -> None:
+	if environment == "prod" and not REQUEST_INVESTIGATION_TOKEN:
+		raise HTTPException(
+			status_code=503,
+			detail="Production access is unavailable until REQUEST_INVESTIGATION_TOKEN is configured",
+		)
+	authorize_request_investigation(token)
