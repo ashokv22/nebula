@@ -7,6 +7,12 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from core import config
+from core.security import (
+    EXTERNAL_AI,
+    INTERNAL_INVESTIGATION,
+    redact_lead_entry,
+    redact_lead_evidence_text,
+)
 from lens import lead_service, parser, router, schemas
 
 
@@ -53,6 +59,220 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertIsNone(entry["request_id"])
         self.assertEqual(parser.extract_request_id(entry), "Req_1234")
 
+    def test_sensitive_customer_fields_are_redacted_from_raw_and_message(self):
+        message = (
+            'LeadDto(customerName=Jane Doe, dob=1990-01-02, phoneNumber=9876543210, '
+            'address=12 Example Road, pinCode=560001, aadhaarVaultNumber=VAULT-98765, '
+            'otp=4321, panNumber=ABCDE1234F, email=jane@example.com, '
+            'password=secret123, leadId=2977, status=200, duration=42ms)'
+        )
+        entry = self.entry(1, message)
+        redacted = redact_lead_entry(entry, "2977")
+        self.assertIn("Jane Doe", entry["raw"])
+        for field in ("raw", "message"):
+            value = redacted[field]
+            for sensitive in (
+                "Jane Doe", "1990-01-02", "9876543210", "12 Example Road",
+                "560001", "VAULT-98765", "4321", "ABCDE1234F",
+                "jane@example.com", "secret123",
+            ):
+                self.assertNotIn(sensitive, value)
+            self.assertIn("leadId=2977", value)
+            self.assertIn("status=200", value)
+            self.assertIn("duration=42ms", value)
+
+    def test_credentials_and_otp_fields_are_redacted(self):
+        credential_field = "pass" + "word=credential_value_123"
+        otp_field = "otp=8412"
+        text = f"ApplicantDto({credential_field}, {otp_field})"
+        redacted = redact_lead_entry({"raw": text, "message": text})
+        self.assertNotIn("credential_value_123", redacted["raw"])
+        self.assertNotIn("credential_value_123", redacted["message"])
+        self.assertNotIn("8412", redacted["raw"])
+        self.assertNotIn("8412", redacted["message"])
+
+    def test_mixed_dto_fields_use_boundaries_before_technical_fields(self):
+        message = (
+            "LeadDto(firstName=Jane Doe, emailAddress=jane@example.com, status=500, "
+            "errorCode=VALIDATION_FAILED, loanAmount=150000, lastName=Example)"
+        )
+        redacted = redact_lead_evidence_text(message)
+        for value in ("Jane Doe", "jane@example.com", "Example"):
+            self.assertNotIn(value, redacted)
+        for field in ("status=500", "errorCode=VALIDATION_FAILED", "loanAmount=150000"):
+            self.assertIn(field, redacted)
+
+    def test_nested_dto_and_json_payloads_redact_recursively(self):
+        dto = (
+            "LeadDto(applicant=ApplicantDto(firstName=Jane Doe, "
+            "contact=ContactDto(phoneNumber=9876543210)))"
+        )
+        json_payload = (
+            '{"lead":{"applicant":{"firstName":"Jane Doe",'
+            '"contact":{"emailAddress":"jane@example.com"}},'
+            '"status":500,"errorCode":"VALIDATION_FAILED","loanAmount":150000}}'
+        )
+        for value in (dto, json_payload):
+            redacted = redact_lead_evidence_text(value)
+            self.assertNotIn("Jane Doe", redacted)
+            self.assertNotIn("9876543210", redacted)
+            self.assertNotIn("jane@example.com", redacted)
+        self.assertIn('"status":500', redact_lead_evidence_text(json_payload))
+        self.assertIn('"errorCode":"VALIDATION_FAILED"', redact_lead_evidence_text(json_payload))
+        self.assertIn('"loanAmount":150000', redact_lead_evidence_text(json_payload))
+
+    def test_empty_sensitive_fields_and_generic_names_are_preserved(self):
+        message = "Dto(firstName=, name=Application, line1=Header, pin=retry, id=order-1)"
+        redacted = redact_lead_evidence_text(message)
+        self.assertIn("firstName=", redacted)
+        self.assertIn("name=Application", redacted)
+        self.assertIn("line1=Header", redacted)
+        self.assertIn("pin=retry", redacted)
+        self.assertIn("id=order-1", redacted)
+
+    def test_internal_and_external_policies_preserve_or_pseudonymize_identifiers(self):
+        payload = (
+            '{"leadId":"L-1","requestId":"Req_1234","traceId":"trace-1",'
+            '"status":500,"errorCode":"E-1","timestamp":"2026-10-23T12:00:00Z"}'
+        )
+        internal = redact_lead_evidence_text(
+            payload, "L-1", policy=INTERNAL_INVESTIGATION
+        )
+        self.assertIn('"leadId":"L-1"', internal)
+        self.assertIn('"requestId":"Req_1234"', internal)
+        self.assertIn('"status":500', internal)
+        self.assertIn('"errorCode":"E-1"', internal)
+        with patch.dict("os.environ", {"API_TOKEN": "synthetic-pseudonym-key"}):
+            external = redact_lead_evidence_text(payload, policy=EXTERNAL_AI)
+            repeat = redact_lead_evidence_text(payload, policy=EXTERNAL_AI)
+            dto = redact_lead_evidence_text(
+                "LeadDto(leadId=L-1, status=500)",
+                policy=EXTERNAL_AI,
+            )
+        self.assertEqual(external, repeat)
+        self.assertNotIn("L-1", external)
+        self.assertNotIn("Req_1234", external)
+        self.assertIn("[ID_", external)
+        self.assertIn('"status":500', external)
+        self.assertNotIn("L-1", dto)
+        self.assertIn("status=500", dto)
+
+    def test_standalone_contact_identity_and_authentication_patterns_are_redacted(self):
+        message = (
+            "Contact jane@example.com 9876543210, PAN ABCDE1234F, "
+            "Aadhaar 1234 5678 9012, Authorization: Bearer synthetic-token-123, "
+            "JWT eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMjM0NTY3ODkwIn0.syntheticSignatureValue"
+        )
+        redacted = redact_lead_evidence_text(message)
+        for value in (
+            "jane@example.com", "9876543210", "ABCDE1234F",
+            "1234 5678 9012", "synthetic-token-123", "syntheticSignatureValue",
+        ):
+            self.assertNotIn(value, redacted)
+
+    def test_external_policy_omits_malformed_structured_payload(self):
+        malformed = "ApplicantDto(firstName=Jane Doe"
+        self.assertIn("[REDACTED]", redact_lead_evidence_text(malformed))
+        self.assertEqual(
+            redact_lead_evidence_text(malformed, policy=EXTERNAL_AI),
+            "[UNSAFE_PAYLOAD_OMITTED]",
+        )
+        self.assertEqual(
+            redact_lead_evidence_text('{"phoneNumber":"9876543210"', policy=EXTERNAL_AI),
+            "[UNSAFE_PAYLOAD_OMITTED]",
+        )
+        unsupported = "A free-form customer note with no safe event attributes"
+        self.assertEqual(
+            redact_lead_evidence_text(unsupported, policy=EXTERNAL_AI),
+            "[UNSAFE_PAYLOAD_OMITTED]",
+        )
+        self.assertEqual(
+            redact_lead_evidence_text('{"customer":"Jane Doe"}', policy=EXTERNAL_AI),
+            "[UNSAFE_PAYLOAD_OMITTED]",
+        )
+
+    def test_ai_context_records_omission_of_unsupported_payload(self):
+        investigation = {
+            "environment": "uat",
+            "searchedDays": 7,
+            "retrieval": {"identifierCorrelation": "candidate"},
+            "limitations": [],
+            "evidence": [{
+                "evidenceRef": "evidence-unsafe", "timestamp": "2026-10-23T12:00:00+00:00",
+                "requestId": "Req_1234", "username": None, "severity": "INFO",
+                "source": "lead_match", "eventCategory": "TECHNICAL",
+                "matchedAliases": ["leadId"], "raw": "",
+                "message": "A free-form customer note with no safe event attributes",
+            }],
+        }
+        with patch.dict("os.environ", {"API_TOKEN": "synthetic-pseudonym-key"}):
+            context, refs, _ = lead_service.build_lead_ai_context(investigation)
+        self.assertNotIn("free-form customer note", context)
+        self.assertIn("evidence-unsafe", context)
+        self.assertEqual(refs, {"evidence-unsafe"})
+        self.assertIn("Raw payload omitted from AI context", context)
+
+    def test_nested_json_sensitive_fields_and_technical_context_are_preserved(self):
+        entry = self.entry(
+            1,
+            '{"lead":{"firstName":"Jane Doe","address":{"line1":"12 Example Road"},'
+            '"aadhaarRef":"vault-123","otp":"9988"},"status":422,'
+            '"errorCode":"VALIDATION_FAILED","durationMs":15}',
+        )
+        redacted = redact_lead_entry(entry, "2977")
+        for sensitive in ("Jane Doe", "12 Example Road", "vault-123", "9988"):
+            self.assertNotIn(sensitive, redacted["raw"])
+            self.assertNotIn(sensitive, redacted["message"])
+        for technical in ('"status":422', '"errorCode":"VALIDATION_FAILED"', '"durationMs":15'):
+            self.assertIn(technical, redacted["message"])
+
+    def test_numeric_amount_status_duration_and_identifiers_are_not_phone_redacted(self):
+        source = (
+            "amount=9876543210 durationMs=9123456789 status=500 "
+            "errorCode=123456789012 requestId=9876543210"
+        )
+        redacted = redact_lead_entry({"raw": source, "message": source})
+        self.assertEqual(redacted["raw"], source)
+        self.assertEqual(redacted["message"], source)
+
+    def test_event_classification_prioritizes_failure_and_business_events(self):
+        examples = (
+            (self.entry(1, "LeadSecurityService access check allowed", level="INFO"), "ACCESS_CHECK"),
+            (self.entry(2, "Application stage changed from DRAFT to REVIEW"), "STAGE_TRANSITION"),
+            (self.entry(3, "Application resubmitted after correction"), "REWORK"),
+            (self.entry(4, "External API request completed"), "EXTERNAL_API"),
+            (self.entry(5, "Lead application submitted"), "BUSINESS_ACTION"),
+            (self.entry(6, "LeadSecurityService access denied", level="ERROR"), "FAILURE"),
+            (self.entry(7, "Controller request started"), "TECHNICAL"),
+        )
+        for entry, category in examples:
+            with self.subTest(entry=entry["message"]):
+                self.assertEqual(lead_service.classify_lead_event(entry), category)
+
+    def test_request_selection_prioritizes_business_events_and_spreads_chronologically(self):
+        candidates = []
+        for index in range(30):
+            request_id = f"Req_{index:04d}"
+            message = (
+                "LeadSecurityService access check allowed"
+                if index < 20 else
+                "Lead application submitted"
+            )
+            entry = self.entry(index % 59, f'{{"leadId":"2977"}} {message}', request_id=request_id)
+            candidates.append({"entry": entry, "aliases": {"leadId"}})
+        selected, stats = lead_service.select_request_ids(candidates, 5)
+        self.assertEqual(len(selected), 5)
+        self.assertTrue(all(request_id in {f"Req_{i:04d}" for i in range(20, 30)}
+                            for request_id in selected))
+        timestamps = [
+            min(item["entry"]["timestamp"] for item in candidates
+                if parser.extract_request_id(item["entry"]) == request_id)
+            for request_id in selected
+        ]
+        self.assertEqual(timestamps, sorted(timestamps))
+        self.assertEqual(stats["routineAccessRequestIdsOmitted"], 20)
+        self.assertTrue(stats["truncated"])
+
     def test_identifier_aliases_are_candidates_and_cross_alias_is_ambiguous(self):
         lines = [
             self.entry(1, '{"leadId":"12345","applicationId":"67890"}'),
@@ -82,11 +302,37 @@ class LeadIntelligenceTests(unittest.TestCase):
                          sorted(item["timestamp"] for item in result["evidence"]))
         self.assertEqual(len(result["evidence"]), 3)
         self.assertEqual(result["requestTimelines"][0]["request"]["requestId"], "Req_1234")
+        schemas.LeadInvestigationResponse.model_validate(result)
         self.assertEqual(
             {event["requestId"] for event in result["requestTimelines"][0]["events"]},
             {"Req_1234"},
         )
         self.assertTrue(all("evidenceRef" in event for event in result["requestTimelines"][0]["events"]))
+        self.assertEqual(result["evidence"][0]["eventCategory"], "TECHNICAL")
+        self.assertEqual(set(result["timingsMs"]), {
+            "lokiDiscovery", "requestCorrelation", "preprocessing", "total",
+        })
+        self.assertTrue(all(value >= 0 for value in result["timingsMs"].values()))
+
+    def test_redacted_duplicate_looking_entries_keep_distinct_evidence_references(self):
+        first = self.entry(1, '{"leadId":"L-1","customerName":"Alice Example"}')
+        second = self.entry(1, '{"leadId":"L-1","customerName":"Bob Example"}')
+
+        async def fake_loki(query, *args, **kwargs):
+            return [second, first] if "Req_1234" in query else [first, second]
+
+        with patch("lens.lead_service.loki_query", new=AsyncMock(side_effect=fake_loki)):
+            result = asyncio.run(lead_service.investigate_lead("L-1", "uat", 7))
+        self.assertEqual(len(result["evidence"]), 2)
+        self.assertEqual(
+            result["evidence"][0]["raw"],
+            result["evidence"][1]["raw"],
+        )
+        evidence_refs = {item["evidenceRef"] for item in result["evidence"]}
+        timeline_refs = {
+            event["evidenceRef"] for event in result["requestTimelines"][0]["events"]
+        }
+        self.assertEqual(timeline_refs, evidence_refs)
 
     def test_loki_pagination_splits_saturated_ranges_and_observes_limits(self):
         first_page = [self.entry(1, '{"leadId":"L-1"}')]
@@ -152,18 +398,24 @@ class LeadIntelligenceTests(unittest.TestCase):
             "evidence": [{
                 "evidenceRef": "evidence-1", "timestamp": "2026-10-23T12:00:00+00:00",
                 "requestId": "Req_1234", "username": "test_user", "severity": "INFO",
-                "source": "lead_match", "matchedAliases": ["leadId"], "raw": "",
+                "source": "lead_match", "eventCategory": "BUSINESS_ACTION",
+                "matchedAliases": ["leadId"], "raw": "",
                 "message": '{"leadId":"private-lead","result":"ok"}',
             }],
         }
-        with patch.object(config, "LEAD_AI_MAX_CONTEXT_CHARS", 1000):
+        with (
+            patch.object(config, "LEAD_AI_MAX_CONTEXT_CHARS", 1000),
+            patch.dict("os.environ", {"API_TOKEN": "synthetic-pseudonym-key"}),
+        ):
             context, refs, truncated = lead_service.build_lead_ai_context(investigation)
         self.assertNotIn("private-lead", context)
         self.assertNotIn("Req_1234", context)
         self.assertNotIn("test_user", context)
         self.assertIn('"hasRequestId":true', context)
-        self.assertIn("[LEAD_ID]", context)
+        self.assertIn("[ID_", context)
         self.assertEqual(refs, {"evidence-1"})
+        self.assertIn('"evidenceRef":"evidence-1"', context)
+        self.assertIn('"eventCategory":"BUSINESS_ACTION"', context)
         self.assertFalse(truncated)
 
     def test_analysis_rejects_unknown_actions_and_requires_evidence_navigation_context(self):

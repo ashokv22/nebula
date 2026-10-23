@@ -83,7 +83,23 @@ made for an empty evidence set.
 Lead retrieval limits are configurable through `LEAD_MAX_DAYS` (30),
 `LEAD_MAX_REQUEST_IDS` (20), `LEAD_MAX_RETRIEVED_LINES` (2000),
 `LEAD_LOKI_PAGE_SIZE` (500), `LEAD_MAX_LOKI_QUERIES` (120), and
-`LEAD_AI_MAX_CONTEXT_CHARS` (10000). Range, pagination, request-ID, and AI
+`LEAD_AI_MAX_CONTEXT_CHARS` (10000), and `LEAD_SECURITY_ACCESS_LOGGER`
+(`LeadSecurityService`) identifies routine access-check logs. Range, pagination, request-ID, and AI
 context truncation are reflected in the response limitations and retrieval
 statistics. The query parameters accept `days` from 1 through 30; a lower
 `LEAD_MAX_DAYS` setting caps the searched window.
+
+Lead evidence uses separate `INTERNAL_INVESTIGATION` and `EXTERNAL_AI`
+redaction policies. The API response masks customer information and secrets in
+both `raw` and `message` while retaining authorized correlation and technical
+diagnostic fields. The Groq context pseudonymizes identifiers and uses only
+structured, allowlisted event attributes; malformed or unsupported payload
+bodies are omitted and noted as limitations. Set `LEAD_PSEUDONYM_KEY` to keep
+pseudonyms stable independently of Groq credential rotation; when unset, the
+configured `API_TOKEN` is used as the HMAC key.
+
+Evidence includes deterministic event categories. Request timelines prioritize
+failure, stage, rework, external API, and business events, select across the
+observed time range, and omit access-check-only requests; access checks remain
+visible in matched evidence and correlated timelines. `timingsMs` reports
+Loki discovery, request correlation, preprocessing, and total duration.

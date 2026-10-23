@@ -34,6 +34,15 @@ class LeadEvidence(BaseModel):
     username: str | None = None
     severity: str | None = None
     source: Literal["lead_match", "request_timeline"]
+    eventCategory: Literal[
+        "BUSINESS_ACTION",
+        "STAGE_TRANSITION",
+        "FAILURE",
+        "REWORK",
+        "EXTERNAL_API",
+        "ACCESS_CHECK",
+        "TECHNICAL",
+    ]
     matchedAliases: list[str] = Field(default_factory=list)
     raw: str
     message: str
@@ -46,6 +55,7 @@ class LeadInvestigationResponse(BaseModel):
     searchedDays: int
     candidateCount: int
     relatedRequestIds: list[str]
+    timingsMs: dict[str, float]
     evidence: list[LeadEvidence]
     requestTimelines: list[dict]
     retrieval: dict
