@@ -136,16 +136,20 @@ class LeadIntelligenceTests(unittest.TestCase):
             sum(item["eventCategory"] == "BUSINESS_ACTION" for item in result["evidence"]),
             0,
         )
-        timeline_events = result["requestTimelines"][0]["events"]
         self.assertEqual(
-            {event["eventType"] for event in timeline_events},
+            {item["eventType"] for item in result["evidence"]},
             {"API_REQUEST", "API_RESPONSE", "WEBHOOK_RECEIVED"},
         )
-        self.assertTrue(all(body_marker not in event["raw"] for event in timeline_events))
+        self.assertTrue(all("raw" not in item for item in result["evidence"]))
+        self.assertTrue(all(body_marker not in item["message"] for item in result["evidence"]))
         self.assertEqual(
-            {event["evidenceRef"] for event in timeline_events},
+            {reference for timeline in result["requestTimelines"] for reference in timeline["evidenceRefs"]},
             {item["evidenceRef"] for item in result["evidence"]},
         )
+        self.assertEqual(result["requestTimelines"][0]["eventCount"], 3)
+        self.assertEqual(result["requestTimelines"][0]["failureCount"], 0)
+        self.assertNotIn("events", result["requestTimelines"][0])
+        schemas.LeadInvestigationResponse.model_validate(result)
 
     def test_unrecognized_request_timeline_entries_are_not_compacted(self):
         entry = self.entry(1, "ordinary application diagnostic without an API payload")
@@ -374,6 +378,25 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertEqual(stats["routineAccessRequestIdsOmitted"], 20)
         self.assertTrue(stats["truncated"])
 
+    def test_request_selection_keeps_meaningful_events_ahead_of_technical_activity(self):
+        candidates = []
+        for index in range(60):
+            message = (
+                "Application stage changed from REVIEW to APPROVED"
+                if index in {5, 25, 45} else
+                "routine application trace emitted"
+            )
+            entry = self.entry(
+                index % 59,
+                f'{{"leadId":"2977"}} {message}',
+                request_id=f"Req_{index:04d}",
+            )
+            candidates.append({"entry": entry, "aliases": {"leadId"}})
+        selected, stats = lead_service.select_request_ids(candidates, 5)
+        self.assertEqual(len(selected), 5)
+        self.assertTrue({"Req_0005", "Req_0025", "Req_0045"}.issubset(selected))
+        self.assertEqual(stats["routineTechnicalRequestIdsOmitted"], 55)
+
     def test_identifier_aliases_are_candidates_and_cross_alias_is_ambiguous(self):
         lines = [
             self.entry(1, '{"leadId":"12345","applicationId":"67890"}'),
@@ -402,13 +425,13 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertEqual([item["timestamp"] for item in result["evidence"]],
                          sorted(item["timestamp"] for item in result["evidence"]))
         self.assertEqual(len(result["evidence"]), 3)
-        self.assertEqual(result["requestTimelines"][0]["request"]["requestId"], "Req_1234")
+        self.assertEqual(result["requestTimelines"][0]["requestId"], "Req_1234")
+        self.assertEqual(result["requestTimelines"][0]["eventCount"], 3)
         schemas.LeadInvestigationResponse.model_validate(result)
-        self.assertEqual(
-            {event["requestId"] for event in result["requestTimelines"][0]["events"]},
-            {"Req_1234"},
-        )
-        self.assertTrue(all("evidenceRef" in event for event in result["requestTimelines"][0]["events"]))
+        self.assertTrue(all(
+            reference in {item["evidenceRef"] for item in result["evidence"]}
+            for reference in result["requestTimelines"][0]["evidenceRefs"]
+        ))
         self.assertEqual(result["evidence"][0]["eventCategory"], "TECHNICAL")
         self.assertEqual(set(result["timingsMs"]), {
             "lokiDiscovery", "requestCorrelation", "preprocessing", "total",
@@ -425,14 +448,9 @@ class LeadIntelligenceTests(unittest.TestCase):
         with patch("lens.lead_service.loki_query", new=AsyncMock(side_effect=fake_loki)):
             result = asyncio.run(lead_service.investigate_lead("L-1", "uat", 7))
         self.assertEqual(len(result["evidence"]), 2)
-        self.assertEqual(
-            result["evidence"][0]["raw"],
-            result["evidence"][1]["raw"],
-        )
+        self.assertEqual(result["evidence"][0]["message"], result["evidence"][1]["message"])
         evidence_refs = {item["evidenceRef"] for item in result["evidence"]}
-        timeline_refs = {
-            event["evidenceRef"] for event in result["requestTimelines"][0]["events"]
-        }
+        timeline_refs = set(result["requestTimelines"][0]["evidenceRefs"])
         self.assertEqual(timeline_refs, evidence_refs)
 
     def test_loki_pagination_splits_saturated_ranges_and_observes_limits(self):
@@ -479,6 +497,49 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertEqual(result["relatedRequestIds"], ["Req_1234"])
         self.assertTrue(result["retrieval"]["requestIdsTruncated"])
         self.assertIn("Related request IDs were capped", " ".join(result["limitations"]))
+
+    def test_evidence_cap_preserves_priority_chronology_and_reference_integrity(self):
+        lines = [
+            self.entry(index, f'{{"leadId":"L-1"}} routine log {index}',
+                       request_id=f"Req_{index:04d}")
+            for index in range(1, 7)
+        ]
+        lines[0] = self.entry(1, '{"leadId":"L-1"} routine technical line',
+                              request_id="Req_0001")
+        lines[2] = self.entry(3, '{"leadId":"L-1"} validation failed',
+                              request_id="Req_0003", level="ERROR")
+        lines[5] = self.entry(6, '{"leadId":"L-1"} application stage changed from A to B',
+                              request_id="Req_0006")
+
+        async def fake_loki(query, *args, **kwargs):
+            return [] if " |~ " in query and "leadId" not in query else lines
+
+        with (
+            patch.object(config, "LEAD_MAX_EVIDENCE", 3),
+            patch.object(config, "LEAD_MAX_REQUEST_IDS", 20),
+            patch("lens.lead_service.loki_query", new=AsyncMock(side_effect=fake_loki)),
+        ):
+            result = asyncio.run(lead_service.investigate_lead("L-1", "uat", 7))
+        self.assertEqual(len(result["evidence"]), 3)
+        self.assertTrue(result["retrieval"]["evidenceTruncated"])
+        self.assertIn("Evidence was capped", " ".join(result["limitations"]))
+        self.assertIn("FAILURE", {item["eventCategory"] for item in result["evidence"]})
+        self.assertIn("STAGE_TRANSITION", {item["eventCategory"] for item in result["evidence"]})
+        timestamps = [item["timestamp"] for item in result["evidence"]]
+        self.assertEqual(timestamps, sorted(timestamps))
+        evidence_refs = {item["evidenceRef"] for item in result["evidence"]}
+        for timeline in result["requestTimelines"]:
+            self.assertTrue(set(timeline["evidenceRefs"]).issubset(evidence_refs))
+
+    def test_request_timeline_query_batches_exact_ids_and_filters_routine_lines(self):
+        query = lead_service.request_timeline_query(
+            '{env="uat",app="uat"}',
+            ["Req_1234", "Req_5678"],
+        )
+        self.assertIn(r"\[(Req_1234|Req_5678),", query)
+        self.assertEqual(query.count("|~"), 2)
+        self.assertIn("stage", query)
+        self.assertNotIn("Req_1234|Req_5678|.*", query)
 
     def test_environment_isolation_and_configured_range_cap_are_reported(self):
         with (

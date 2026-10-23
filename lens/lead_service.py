@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import re
@@ -11,13 +12,11 @@ from core import config
 from core.config import selector_for_environment
 from core.security import (
     EXTERNAL_AI,
-    redact_lead_entry,
     redact_lead_evidence_text,
 )
 from lens.loki import loki_query
 from lens.parser import extract_request_id, request_entry_matches
 from lens.schemas import LeadIntelligenceModel
-from lens.service import build_request_investigation
 
 LEAD_ALIASES = ("leadId", "applicantId", "applicationId", "partnerLoanId")
 LEAD_FIELD = re.compile(
@@ -116,6 +115,20 @@ API_BODY_ERROR_PATTERN = re.compile(
 )
 WEBHOOK_PAYLOAD_MARKER = re.compile(r"(?i)\bExternal ReverseMapping Payload\s*:")
 MAX_API_METADATA_PREFIX = 4096
+MAX_EVIDENCE_SUMMARY_CHARS = 240
+MEANINGFUL_REQUEST_CATEGORIES = frozenset({
+    "FAILURE", "STAGE_TRANSITION", "REWORK", "EXTERNAL_API", "BUSINESS_ACTION",
+})
+TIMELINE_SIGNAL_PATTERN = re.compile(
+    r"(?i)(?:\bREQ (?:START|END)\b|"
+    r"\b(?:error|exception|failed|failure|invalid|rejected|denied|unauthorized|forbidden|"
+    r"timeout|timed\s*out|4\d\d|5\d\d|stage|transition|rework|resubmi(?:t|ssion)|"
+    r"retry|retried|re-?attempt|correction|returned\s+for|"
+    r"external\s+api|third.party|downstream|integration|"
+    r"created|submitted|updated|approved|rejected|validated|saved|processed|initiated|"
+    r"submission|validation|approval|disbursement)\b|"
+    r"\b(?:saveLoan|getLoanStatus)\b|External ReverseMapping Payload)"
+)
 
 
 def classify_lead_event(entry: dict) -> str:
@@ -163,6 +176,7 @@ def select_request_ids(candidate_events: list[dict], maximum: int) -> tuple[list
         group["events"] += 1
 
     ranked = []
+    technical = []
     for request_id, group in grouped.items():
         highest_priority = max(
             (EVENT_CATEGORY_PRIORITY[category] for category in group["categories"]),
@@ -171,16 +185,24 @@ def select_request_ids(candidate_events: list[dict], maximum: int) -> tuple[list
         if highest_priority == EVENT_CATEGORY_PRIORITY["ACCESS_CHECK"]:
             continue
         group["score"] = highest_priority + min(group["events"], 5)
-        ranked.append((request_id, group))
+        target = ranked if any(
+            category in MEANINGFUL_REQUEST_CATEGORIES for category in group["categories"]
+        ) else technical
+        target.append((request_id, group))
 
-    ranked.sort(key=lambda candidate: candidate[1]["timestamp"])
+    # Use technical-only requests to fill unused slots after meaningful requests.
+    selection_pool = ranked if len(ranked) >= maximum or not technical else ranked + technical
+    if not ranked:
+        selection_pool = technical
+
+    selection_pool.sort(key=lambda candidate: candidate[1]["timestamp"])
     selected = []
-    if maximum > 0 and len(ranked) > maximum:
-        first = datetime.fromisoformat(ranked[0][1]["timestamp"].replace("Z", "+00:00"))
-        last = datetime.fromisoformat(ranked[-1][1]["timestamp"].replace("Z", "+00:00"))
+    if maximum > 0 and len(selection_pool) > maximum:
+        first = datetime.fromisoformat(selection_pool[0][1]["timestamp"].replace("Z", "+00:00"))
+        last = datetime.fromisoformat(selection_pool[-1][1]["timestamp"].replace("Z", "+00:00"))
         span_seconds = max(1.0, (last - first).total_seconds())
         buckets = [[] for _ in range(maximum)]
-        for candidate in ranked:
+        for candidate in selection_pool:
             at = datetime.fromisoformat(candidate[1]["timestamp"].replace("Z", "+00:00"))
             index = min(maximum - 1, int((at - first).total_seconds() / span_seconds * maximum))
             buckets[index].append(candidate)
@@ -196,7 +218,7 @@ def select_request_ids(candidate_events: list[dict], maximum: int) -> tuple[list
                 ))
         selected_ids = {item[0] for item in selected}
         remaining = [
-            candidate for candidate in ranked if candidate[0] not in selected_ids
+            candidate for candidate in selection_pool if candidate[0] not in selected_ids
         ]
         remaining.sort(
             key=lambda candidate: (
@@ -208,24 +230,40 @@ def select_request_ids(candidate_events: list[dict], maximum: int) -> tuple[list
         )
         selected.extend(remaining[:maximum - len(selected)])
     else:
-        selected = ranked
+        selected = selection_pool
 
     selected = sorted(selected[:maximum], key=lambda candidate: candidate[1]["timestamp"])
+    selected_technical_count = sum(
+        candidate in technical for candidate in selected
+    )
     return [request_id for request_id, _ in selected], {
         "discoveredRequestIds": len(grouped),
         "eligibleRequestIds": len(ranked),
-        "routineAccessRequestIdsOmitted": len(grouped) - len(ranked),
+        "routineAccessRequestIdsOmitted": sum(
+            1 for _, group in grouped.items()
+            if set(group["categories"]) == {"ACCESS_CHECK"}
+        ),
+        "routineTechnicalRequestIdsOmitted": len(technical) - selected_technical_count,
         "selectedRequestIds": len(selected),
-        "truncated": len(ranked) > maximum,
+        "truncated": len(selection_pool) > maximum,
     }
 
 
 def _entry_key(entry: dict) -> tuple[str, str]:
-    return entry["timestamp"], entry.get("raw", entry.get("message", ""))
+    return entry.get("_leadOriginalKey") or (
+        entry["timestamp"],
+        entry.get("raw", entry.get("message", "")),
+    )
 
 
-def matched_lead_aliases(entry: dict, lead_id: str) -> list[str]:
+def matched_lead_aliases(
+    entry: dict,
+    lead_id: str,
+    max_chars: int | None = None,
+) -> list[str]:
     text = entry.get("message") or entry.get("raw") or ""
+    if max_chars is not None:
+        text = text[:max_chars]
     matched = set()
     for match in LEAD_FIELD.finditer(text):
         value = next((group for group in match.groups()[1:] if group is not None), None)
@@ -236,6 +274,8 @@ def matched_lead_aliases(entry: dict, lead_id: str) -> list[str]:
 
 
 def compact_large_api_entry(entry: dict) -> dict:
+    if entry.get("leadApiMetadata"):
+        return entry
     message = entry.get("message") or ""
     prefix = message[:MAX_API_METADATA_PREFIX]
     logger = entry.get("logger") or ""
@@ -321,6 +361,15 @@ def compact_large_api_entry(entry: dict) -> dict:
         + (f" errorCode={metadata['errorCode']}" if metadata["errorCode"] else "")
     )
     compacted = dict(entry)
+    original = entry.get("raw") or message
+    original_digest = hashlib.sha256(
+        original[:MAX_API_METADATA_PREFIX].encode("utf-8")
+    )
+    original_digest.update(str(len(original)).encode("ascii"))
+    compacted["_leadOriginalKey"] = (
+        entry["timestamp"],
+        original_digest.hexdigest(),
+    )
     compacted["message"] = safe_message
     request_id = extract_request_id(entry) or ""
     compacted["raw"] = (
@@ -342,6 +391,39 @@ def _query_pattern(lead_id: str) -> str:
         + re.escape(lead_id)
         + r"""([^A-Za-z0-9_-]|$)"""
     )
+
+
+def request_timeline_query(selector: str, request_ids: list[str]) -> str:
+    request_pattern = r"\[(" + "|".join(re.escape(item) for item in request_ids) + r"),"
+    return (
+        selector
+        + " |~ " + json.dumps(request_pattern)
+        + " |~ " + json.dumps(TIMELINE_SIGNAL_PATTERN.pattern)
+    )
+
+
+def summarize_lead_entry(entry: dict, lead_id: str) -> dict:
+    source_message = entry.get("message") or ""
+    message = redact_lead_evidence_text(source_message[:4096], lead_id)
+    summary = message[:MAX_EVIDENCE_SUMMARY_CHARS]
+    if len(message) > MAX_EVIDENCE_SUMMARY_CHARS:
+        summary = message[:MAX_EVIDENCE_SUMMARY_CHARS - 3].rstrip() + "..."
+    api = entry.get("leadApiMetadata") or {}
+    return {
+        "timestamp": entry["timestamp"],
+        "requestId": extract_request_id(entry),
+        "username": "[REDACTED]" if entry.get("user") else None,
+        "severity": entry.get("level"),
+        "message": summary,
+        "eventType": api.get("eventType"),
+        "payloadOmitted": bool(api.get("payloadOmitted")),
+        "apiOperation": api.get("operation"),
+        "httpMethod": api.get("httpMethod"),
+        "endpointPath": api.get("endpointPath"),
+        "httpStatus": api.get("httpStatus"),
+        "durationMs": api.get("durationMs"),
+        "errorCode": api.get("errorCode"),
+    }
 
 
 async def _bounded_loki_query(
@@ -426,10 +508,14 @@ async def investigate_lead(
     candidate_query = selector + " |~ " + json.dumps(_query_pattern(lead_id))
 
     def prepare_candidate(entry: dict) -> dict | None:
-        aliases = matched_lead_aliases(entry, lead_id)
+        compacted = compact_large_api_entry(entry)
+        aliases = matched_lead_aliases(
+            entry,
+            lead_id,
+            MAX_API_METADATA_PREFIX if compacted is not entry else None,
+        )
         if not aliases:
             return None
-        compacted = compact_large_api_entry(entry)
         compacted["_matchedLeadAliases"] = aliases
         return compacted
 
@@ -467,6 +553,10 @@ async def investigate_lead(
         limitations.append(
             "Routine access-check-only requests were omitted from request timeline retrieval."
         )
+    if selection_stats["routineTechnicalRequestIdsOmitted"]:
+        limitations.append(
+            "Routine technical-only requests were deprioritized in favor of meaningful lead events."
+        )
 
     timeline_lines: list[dict] = []
     timeline_stats = {
@@ -477,8 +567,11 @@ async def investigate_lead(
         "pageSize": 0,
     }
     if request_ids:
-        request_pattern = r"\[(" + "|".join(re.escape(item) for item in request_ids) + r"),"
-        timeline_query = selector + " |~ " + json.dumps(request_pattern)
+        timeline_query = request_timeline_query(selector, request_ids)
+
+        def prepare_timeline_entry(entry: dict) -> dict | None:
+            return compact_large_api_entry(entry)
+
         remaining_line_budget = max(
             0, config.LEAD_MAX_RETRIEVED_LINES - candidate_stats["returnedLines"]
         )
@@ -489,7 +582,7 @@ async def investigate_lead(
                 window_end,
                 remaining_line_budget,
                 max_queries=max(0, config.LEAD_MAX_LOKI_QUERIES - candidate_stats["queryCount"]),
-                entry_processor=compact_large_api_entry,
+                entry_processor=prepare_timeline_entry,
             )
             timeline_lines = [
                 entry for entry in timeline_lines
@@ -520,7 +613,7 @@ async def investigate_lead(
 
     evidence_rows = {}
     for item in candidate_events:
-        entry = redact_lead_entry(item["entry"], lead_id)
+        entry = item["entry"]
         key = _entry_key(item["entry"])
         evidence_rows[key] = {
             "entry": entry,
@@ -533,7 +626,7 @@ async def investigate_lead(
         key = _entry_key(entry)
         if key not in evidence_rows:
             evidence_rows[key] = {
-                "entry": redact_lead_entry(entry, lead_id),
+                "entry": entry,
                 "originalKey": key,
                 "source": "request_timeline",
                 "matchedAliases": sorted(
@@ -542,69 +635,91 @@ async def investigate_lead(
                 "eventCategory": classify_lead_event(entry),
             }
     ordered_rows = sorted(evidence_rows.values(), key=lambda item: item["entry"]["timestamp"])
+    evidence_limit = max(1, config.LEAD_MAX_EVIDENCE)
+    evidence_truncated = len(ordered_rows) > evidence_limit
+    if evidence_truncated:
+        ranked_rows = sorted(
+            ordered_rows,
+            key=lambda row: (
+                EVENT_CATEGORY_PRIORITY[row["eventCategory"]],
+                row["entry"]["timestamp"],
+            ),
+            reverse=True,
+        )
+        retained = ranked_rows[:evidence_limit]
+        # Reserve chronological coverage by selecting the highest-value event in each bucket.
+        if evidence_limit > 1:
+            time_sorted = sorted(ordered_rows, key=lambda row: row["entry"]["timestamp"])
+            start = datetime.fromisoformat(time_sorted[0]["entry"]["timestamp"].replace("Z", "+00:00"))
+            end = datetime.fromisoformat(time_sorted[-1]["entry"]["timestamp"].replace("Z", "+00:00"))
+            span = max(1.0, (end - start).total_seconds())
+            buckets: dict[int, list[dict]] = {}
+            for row in ordered_rows:
+                at = datetime.fromisoformat(row["entry"]["timestamp"].replace("Z", "+00:00"))
+                bucket = min(evidence_limit - 1, int((at - start).total_seconds() / span * evidence_limit))
+                buckets.setdefault(bucket, []).append(row)
+            coverage = [
+                max(
+                    rows,
+                    key=lambda row: (
+                        EVENT_CATEGORY_PRIORITY[row["eventCategory"]],
+                        row["entry"]["timestamp"],
+                    ),
+                )
+                for rows in buckets.values()
+            ]
+            chosen = {id(row): row for row in coverage}
+            chosen.update({id(row): row for row in retained})
+            retained = list(chosen.values())
+            if len(retained) > evidence_limit:
+                retained = sorted(
+                    retained,
+                    key=lambda row: (
+                        EVENT_CATEGORY_PRIORITY[row["eventCategory"]],
+                        row["entry"]["timestamp"],
+                    ),
+                    reverse=True,
+                )[:evidence_limit]
+        ordered_rows = sorted(retained, key=lambda row: row["entry"]["timestamp"])
+        limitations.append(
+            f"Evidence was capped at {evidence_limit} entries; lower-priority evidence was omitted."
+        )
+
     evidence = []
     evidence_ref_by_key = {}
     for index, row in enumerate(ordered_rows, 1):
         entry = row["entry"]
         evidence_ref = f"evidence-{index}"
         evidence_ref_by_key[row["originalKey"]] = evidence_ref
+        summary = summarize_lead_entry(entry, lead_id)
         evidence.append({
             "evidenceRef": evidence_ref,
-            "timestamp": entry["timestamp"],
-            "requestId": extract_request_id(entry),
-            "username": entry.get("user"),
-            "severity": entry.get("level"),
             "source": row["source"],
             "eventCategory": row["eventCategory"],
             "matchedAliases": row["matchedAliases"],
-            "raw": entry.get("raw", ""),
-            "message": entry.get("message", ""),
-            "eventType": (entry.get("leadApiMetadata") or {}).get("eventType"),
-            "payloadOmitted": bool((entry.get("leadApiMetadata") or {}).get("payloadOmitted")),
-            "apiOperation": (entry.get("leadApiMetadata") or {}).get("operation"),
-            "httpMethod": (entry.get("leadApiMetadata") or {}).get("httpMethod"),
-            "endpointPath": (entry.get("leadApiMetadata") or {}).get("endpointPath"),
-            "httpStatus": (entry.get("leadApiMetadata") or {}).get("httpStatus"),
-            "durationMs": (entry.get("leadApiMetadata") or {}).get("durationMs"),
-            "errorCode": (entry.get("leadApiMetadata") or {}).get("errorCode"),
+            **summary,
         })
 
+    evidence_refs_by_request: dict[str, list[str]] = {}
+    for item in evidence:
+        if item["requestId"] in request_ids:
+            evidence_refs_by_request.setdefault(item["requestId"], []).append(item["evidenceRef"])
     request_timelines = []
     for request_id in request_ids:
-        entries = []
-        original_keys = []
-        for entry in timeline_lines:
-            if request_entry_matches(entry, request_id):
-                original_keys.append(_entry_key(entry))
-                redacted_entry = redact_lead_entry(entry, lead_id)
-                redacted_entry["request_id"] = extract_request_id(entry)
-                entries.append(redacted_entry)
-        entries.sort(key=lambda entry: entry["timestamp"])
-        timeline = build_request_investigation(
-            request_id,
-            entries,
-            searched_days * 1440,
-            max(1, config.LEAD_MAX_RETRIEVED_LINES),
-            window_start,
-            window_end,
-            timeline_stats["returnedLines"],
-        )
-        if timeline["request"].get("uri"):
-            timeline["request"]["uri"] = redact_lead_evidence_text(
-                timeline["request"]["uri"],
-                lead_id,
-            )
-        for event, entry, original_key in zip(timeline["events"], entries, original_keys):
-            event["evidenceRef"] = evidence_ref_by_key.get(original_key)
-            event["correlationAliases"] = sorted(
-                aliases_by_request_id.get(extract_request_id(entry), set())
-            )
-            event["eventCategory"] = classify_lead_event(entry)
-            api_metadata = entry.get("leadApiMetadata")
-            if api_metadata:
-                event["eventType"] = api_metadata["eventType"]
-                event.update(api_metadata)
-        request_timelines.append(timeline)
+        request_evidence = [
+            item for item in evidence if item["requestId"] == request_id
+        ]
+        if not request_evidence:
+            continue
+        request_evidence.sort(key=lambda item: item["timestamp"])
+        request_timelines.append({
+            "requestId": request_id,
+            "startedAt": request_evidence[0]["timestamp"],
+            "endedAt": request_evidence[-1]["timestamp"],
+            "eventCount": len(request_evidence),
+            "failureCount": sum(item["eventCategory"] == "FAILURE" for item in request_evidence),
+            "evidenceRefs": evidence_refs_by_request[request_id],
+        })
 
     aliases_observed = sorted({
         alias for item in candidate_events for alias in item["aliases"]
@@ -626,6 +741,8 @@ async def investigate_lead(
             "routineAccessRequestIdsOmitted": selection_stats["routineAccessRequestIdsOmitted"],
             "returnedRequestIds": len(request_ids),
             "requestIdsTruncated": request_id_truncated,
+            "evidenceTruncated": evidence_truncated,
+            "evidenceLimit": evidence_limit,
             "aliasesObserved": aliases_observed,
             "requestAliases": {
                 request_id: sorted(aliases_by_request_id.get(request_id, set()))
@@ -683,6 +800,13 @@ def build_lead_ai_context(investigation: dict) -> tuple[str, set[str], bool]:
             "eventCategory": item["eventCategory"],
             "matchedAliases": item["matchedAliases"],
             "message": message,
+            "eventType": item.get("eventType"),
+            "apiOperation": item.get("apiOperation"),
+            "httpMethod": item.get("httpMethod"),
+            "endpointPath": item.get("endpointPath"),
+            "httpStatus": item.get("httpStatus"),
+            "durationMs": item.get("durationMs"),
+            "errorCode": item.get("errorCode"),
         })
     safe_context = {
         "environment": investigation["environment"],
@@ -817,7 +941,8 @@ def validate_lead_analysis(
     suggested_checks = []
     request_ids = set(investigation["relatedRequestIds"])
     usernames = {
-        item["username"] for item in investigation["evidence"] if item["username"]
+        item["username"] for item in investigation["evidence"]
+        if item["username"] and item["username"] != "[REDACTED]"
     }
     lead_id = investigation["leadId"]
     for proposal in result["suggestedChecks"]:

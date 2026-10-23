@@ -82,6 +82,7 @@ made for an empty evidence set.
 
 Lead retrieval limits are configurable through `LEAD_MAX_DAYS` (30),
 `LEAD_MAX_REQUEST_IDS` (20), `LEAD_MAX_RETRIEVED_LINES` (2000),
+`LEAD_MAX_EVIDENCE` (300),
 `LEAD_LOKI_PAGE_SIZE` (500), `LEAD_MAX_LOKI_QUERIES` (120), and
 `LEAD_AI_MAX_CONTEXT_CHARS` (10000), and `LEAD_SECURITY_ACCESS_LOGGER`
 (`LeadSecurityService`) identifies routine access-check logs. Range, pagination, request-ID, and AI
@@ -91,8 +92,8 @@ statistics. The query parameters accept `days` from 1 through 30; a lower
 
 Lead evidence uses separate `INTERNAL_INVESTIGATION` and `EXTERNAL_AI`
 redaction policies. The API response masks customer information and secrets in
-both `raw` and `message` while retaining authorized correlation and technical
-diagnostic fields. The Groq context pseudonymizes identifiers and uses only
+log evidence before returning concise summaries, while retaining authorized
+correlation and technical diagnostic fields. The Groq context pseudonymizes identifiers and uses only
 structured, allowlisted event attributes; malformed or unsupported payload
 bodies are omitted and noted as limitations. Set `LEAD_PSEUDONYM_KEY` to keep
 pseudonyms stable independently of Groq credential rotation; when unset, the
@@ -105,8 +106,12 @@ with `payloadOmitted=true` and distinct `API_REQUEST`, `API_RESPONSE`, or
 `WEBHOOK_RECEIVED` event types when recognizable. HTTP 200 is reported only as
 an observed status, not as proof of business success.
 
-Evidence includes deterministic event categories. Request timelines prioritize
-failure, stage, rework, external API, and business events, select across the
-observed time range, and omit access-check-only requests; access checks remain
-visible in matched evidence and correlated timelines. `timingsMs` reports
-Loki discovery, request correlation, preprocessing, and total duration.
+Evidence is the canonical compact collection; raw log lines are not returned,
+and each summary is limited to 240 characters. Request timelines contain only
+request IDs, first/last observed timestamps, event/failure counts, and evidence
+references. Correlation batches selected request IDs into one exact MDC-boundary
+query and filters routine lines in LogQL for failures, business actions, stage
+changes, rework, external APIs, and request markers. Evidence selection
+prioritizes those meaningful categories and retains chronological coverage;
+limits and truncation are reported. `timingsMs` reports Loki discovery, request
+correlation, preprocessing, and total duration.

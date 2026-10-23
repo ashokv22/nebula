@@ -44,8 +44,7 @@ class LeadEvidence(BaseModel):
         "TECHNICAL",
     ]
     matchedAliases: list[str] = Field(default_factory=list)
-    raw: str
-    message: str
+    message: str = Field(max_length=240)
     eventType: Literal["API_REQUEST", "API_RESPONSE", "WEBHOOK_RECEIVED"] | None = None
     payloadOmitted: bool = False
     apiOperation: str | None = None
@@ -54,6 +53,15 @@ class LeadEvidence(BaseModel):
     httpStatus: int | None = None
     durationMs: int | float | None = None
     errorCode: str | None = None
+
+
+class LeadRequestTimelineSummary(BaseModel):
+    requestId: str
+    startedAt: str
+    endedAt: str
+    eventCount: int
+    failureCount: int
+    evidenceRefs: list[str]
 
 
 class LeadInvestigationResponse(BaseModel):
@@ -65,7 +73,7 @@ class LeadInvestigationResponse(BaseModel):
     relatedRequestIds: list[str]
     timingsMs: dict[str, float]
     evidence: list[LeadEvidence]
-    requestTimelines: list[dict]
+    requestTimelines: list[LeadRequestTimelineSummary]
     retrieval: dict
     limitations: list[str]
 
