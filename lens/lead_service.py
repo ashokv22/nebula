@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import math
 import re
 import time
@@ -17,6 +18,8 @@ from core.security import (
 from lens.loki import loki_query
 from lens.parser import extract_request_id, request_entry_matches
 from lens.schemas import LeadIntelligenceModel
+
+logger = logging.getLogger(__name__)
 
 LEAD_ALIASES = ("leadId", "applicantId", "applicationId", "partnerLoanId")
 LEAD_FIELD = re.compile(
@@ -51,6 +54,13 @@ ACTION_CONTEXT = {
     "EXTERNAL_API_INSPECTION": "request",
     "COMPARE_ATTEMPTS": "lead",
 }
+
+
+def _log_lead_analysis_rejection(stage: str, reason: str, **details) -> None:
+    logger.warning(
+        "Lead Intelligence analysis validation failed",
+        extra={"lead_ai_validation": {"stage": stage, "reason": reason, **details}},
+    )
 EVENT_CATEGORY_PRIORITY = {
     "FAILURE": 100,
     "STAGE_TRANSITION": 80,
@@ -855,8 +865,21 @@ def validate_lead_analysis(
     def validate_claim_refs(claim: dict) -> None:
         refs = claim.get("evidenceRefs", [])
         if not refs:
+            _log_lead_analysis_rejection(
+                "evidence_reference_validation",
+                "missing_references",
+                invalid_reference_count=0,
+            )
             raise HTTPException(status_code=502, detail="Groq returned an unsupported evidence claim")
-        if any(reference not in evidence_by_ref for reference in refs):
+        invalid_reference_count = sum(
+            reference not in evidence_by_ref for reference in refs
+        )
+        if invalid_reference_count:
+            _log_lead_analysis_rejection(
+                "evidence_reference_validation",
+                "unknown_reference",
+                invalid_reference_count=invalid_reference_count,
+            )
             raise HTTPException(status_code=502, detail="Groq cited evidence not present in the retrieved context")
         if investigation["retrieval"]["identifierCorrelation"] == "ambiguous":
             alias_groups = [
@@ -866,6 +889,11 @@ def validate_lead_analysis(
             if any(len(aliases) > 1 for aliases in alias_groups) or len(
                 set.union(*alias_groups) if alias_groups else set()
             ) > 1:
+                _log_lead_analysis_rejection(
+                    "evidence_reference_validation",
+                    "ambiguous_identifier_correlation",
+                    invalid_reference_count=len(refs),
+                )
                 raise HTTPException(
                     status_code=502,
                     detail="Groq combined evidence from ambiguous identifier aliases",
@@ -904,6 +932,11 @@ def validate_lead_analysis(
         validate_claim_refs(claim)
     for reference in result["summaryEvidenceRefs"] + result["stageEvidenceRefs"]:
         if reference not in evidence_by_ref:
+            _log_lead_analysis_rejection(
+                "evidence_reference_validation",
+                "unknown_summary_or_stage_reference",
+                invalid_reference_count=1,
+            )
             raise HTTPException(status_code=502, detail="Groq cited evidence not present in the retrieved context")
     if result["currentStage"] and not result["stageEvidenceRefs"]:
         raise HTTPException(status_code=502, detail="Groq returned a stage without supporting evidence")
@@ -965,6 +998,11 @@ def validate_lead_analysis(
                 if item.get("requestId") in request_ids
             ))
             if not candidates:
+                _log_lead_analysis_rejection(
+                    "suggested_check_validation",
+                    "request_id_not_in_evidence",
+                    action_type=action if action in ACTION_CONTEXT else "unsupported",
+                )
                 raise HTTPException(status_code=502, detail="Groq proposed a request check without a supported request ID")
             navigation["requestId"] = candidates[0]
         elif context_type == "user":
@@ -973,6 +1011,11 @@ def validate_lead_analysis(
                 if item.get("username") in usernames
             ))
             if not candidates:
+                _log_lead_analysis_rejection(
+                    "suggested_check_validation",
+                    "username_not_in_evidence",
+                    action_type=action if action in ACTION_CONTEXT else "unsupported",
+                )
                 raise HTTPException(status_code=502, detail="Groq proposed a user check without a supported username")
             navigation["username"] = candidates[0]
         suggested_checks.append({

@@ -2,7 +2,8 @@ import asyncio
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -14,7 +15,7 @@ from core.security import (
     redact_lead_entry,
     redact_lead_evidence_text,
 )
-from lens import lead_service, parser, router, schemas
+from lens import analyzer, lead_service, parser, router, schemas
 
 
 class LeadIntelligenceTests(unittest.TestCase):
@@ -27,6 +28,66 @@ class LeadIntelligenceTests(unittest.TestCase):
             f"[{request_id},{user}] [123] --- example.Controller : {message}"
         )
         return parser.parse_entry(nanoseconds, raw)
+
+    def call_lead_groq_with_content(self, content, finish_reason="stop"):
+        provider_response = SimpleNamespace(
+            status_code=200,
+            raise_for_status=lambda: None,
+            json=lambda: {
+                "choices": [{
+                    "message": {"content": content},
+                    "finish_reason": finish_reason,
+                }],
+                "usage": {"prompt_tokens": 120, "completion_tokens": 80, "total_tokens": 200},
+            },
+        )
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.post = AsyncMock(return_value=provider_response)
+        with (
+            patch("lens.analyzer.httpx.AsyncClient", return_value=client),
+            patch.dict("os.environ", {"API_TOKEN": "synthetic-token"}),
+        ):
+            return asyncio.run(analyzer.call_lead_groq("{}"))
+
+    def test_groq_diagnostics_identify_model_validation_fields_without_input_values(self):
+        unsafe_value = "SYNTHETIC_PRIVATE_CUSTOMER_VALUE"
+        content = json.dumps({
+            "suggestedChecks": [{
+                "action": unsafe_value,
+                "title": "Review",
+                "reason": "Check the evidence",
+                "priority": "low",
+                "evidenceRefs": ["evidence-1"],
+            }],
+        })
+        with self.assertLogs("lens.analyzer", level="WARNING") as captured:
+            with self.assertRaises(HTTPException) as raised:
+                self.call_lead_groq_with_content(content, finish_reason="length")
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(raised.exception.detail, "Groq returned invalid Lead Intelligence")
+        diagnostic = captured.records[0].lead_ai_diagnostic
+        self.assertEqual(diagnostic["stage"], "pydantic_validation")
+        self.assertIn("suggestedChecks.0.action", diagnostic["field_paths"])
+        self.assertEqual(diagnostic["invalid_suggested_checks"], 1)
+        self.assertEqual(diagnostic["finish_reason"], "length")
+        self.assertEqual(diagnostic["total_tokens"], 200)
+        self.assertNotIn(unsafe_value, str(diagnostic))
+
+    def test_groq_diagnostics_report_json_parse_category_and_position_only(self):
+        private_marker = "SYNTHETIC_PRIVATE_RESPONSE_MARKER"
+        with self.assertLogs("lens.analyzer", level="WARNING") as captured:
+            with self.assertRaises(HTTPException) as raised:
+                self.call_lead_groq_with_content('{"value":"' + private_marker)
+
+        self.assertEqual(raised.exception.status_code, 502)
+        diagnostic = captured.records[0].lead_ai_diagnostic
+        self.assertEqual(diagnostic["stage"], "json_parse")
+        self.assertEqual(diagnostic["category"], "unterminated_value")
+        self.assertGreater(diagnostic["position"], 0)
+        self.assertNotIn(private_marker, str(diagnostic))
 
     def test_exact_alias_association_rejects_substrings_and_unrelated_values(self):
         lead = "12345"
@@ -651,9 +712,14 @@ class LeadIntelligenceTests(unittest.TestCase):
         })
 
         base["suggestedChecks"][0]["evidenceRefs"] = []
-        with self.assertRaises(HTTPException) as raised:
-            lead_service.validate_lead_analysis(base, investigation, {"evidence-1"})
+        with self.assertLogs("lens.lead_service", level="WARNING") as captured:
+            with self.assertRaises(HTTPException) as raised:
+                lead_service.validate_lead_analysis(base, investigation, {"evidence-1"})
         self.assertEqual(raised.exception.status_code, 502)
+        diagnostic = captured.records[0].lead_ai_validation
+        self.assertEqual(diagnostic["stage"], "evidence_reference_validation")
+        self.assertEqual(diagnostic["reason"], "missing_references")
+        self.assertEqual(diagnostic["invalid_reference_count"], 0)
 
     def test_ai_claim_cannot_combine_ambiguous_alias_groups(self):
         investigation = {
