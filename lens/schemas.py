@@ -46,6 +46,14 @@ class LeadEvidence(BaseModel):
     matchedAliases: list[str] = Field(default_factory=list)
     raw: str
     message: str
+    eventType: Literal["API_REQUEST", "API_RESPONSE", "WEBHOOK_RECEIVED"] | None = None
+    payloadOmitted: bool = False
+    apiOperation: str | None = None
+    httpMethod: str | None = None
+    endpointPath: str | None = None
+    httpStatus: int | None = None
+    durationMs: int | float | None = None
+    errorCode: str | None = None
 
 
 class LeadInvestigationResponse(BaseModel):

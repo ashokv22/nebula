@@ -98,6 +98,13 @@ bodies are omitted and noted as limitations. Set `LEAD_PSEUDONYM_KEY` to keep
 pseudonyms stable independently of Groq credential rotation; when unset, the
 configured `API_TOKEN` is used as the HMAC key.
 
+Known `saveLoan`/`getLoanStatus` Feign events and `External ReverseMapping
+Payload` webhook logs are compacted during Loki retrieval. Their full payloads
+are excluded from evidence and AI input; only bounded header metadata is kept,
+with `payloadOmitted=true` and distinct `API_REQUEST`, `API_RESPONSE`, or
+`WEBHOOK_RECEIVED` event types when recognizable. HTTP 200 is reported only as
+an observed status, not as proof of business success.
+
 Evidence includes deterministic event categories. Request timelines prioritize
 failure, stage, rework, external API, and business events, select across the
 observed time range, and omit access-check-only requests; access checks remain

@@ -71,7 +71,9 @@ LEAD_EXTERNAL_SAFE_FIELDS = frozenset({
 	"action", "operation", "event", "eventtype", "stage", "fromstage", "tostage",
 	"oldstage", "newstage", "result", "outcome", "validationcode", "failurecode",
 	"apiname", "service", "retrycount", "attempt", "attemptnumber", "method",
-	"logger", "severity", "level", "exceptiontype", "errorclass",
+	"logger", "severity", "level", "exceptiontype", "errorclass", "apioperation",
+	"httpmethod", "endpointpath", "httpstatus", "durationms", "errorcode",
+	"payloadomitted",
 })
 LEAD_EXTERNAL_CONTAINERS = frozenset({
 	"lead", "applicant", "applicantdetails", "customer", "customerdetails", "contact",

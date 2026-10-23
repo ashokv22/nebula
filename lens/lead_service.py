@@ -91,9 +91,40 @@ ACCESS_CHECK_EVENT = re.compile(
     r"access\s+(?:allowed|granted|permitted))\b",
     re.IGNORECASE,
 )
+LARGE_API_OPERATION = re.compile(r"\b(saveLoan|getLoanStatus)\b", re.IGNORECASE)
+LARGE_API_ENDPOINTS = {
+    "/v2/partner/loanApplications": "saveLoan",
+    "/v1/partner/loanReports/": "getLoanStatus",
+}
+API_ENDPOINT_PATTERN = re.compile(
+    r"(?i)(?:https?://[^/\s]+)?(?P<path>/v[12]/partner/"
+    r"(?:loanApplications|loanReports/?[^\s\"',)}]*))"
+)
+API_METHOD_PATTERN = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\b", re.IGNORECASE)
+API_STATUS_PATTERN = re.compile(
+    r"(?i)(?:HTTP/\d(?:\.\d)?\s+|(?:httpstatus(?:code)?|statuscode|status)\s*[:=]\s*)(\d{3})\b"
+)
+API_DURATION_PATTERN = re.compile(
+    r"(?i)(?:duration(?:ms)?|elapsed(?:ms)?|time)\s*[:=]\s*(\d+(?:\.\d+)?)\s*ms?"
+    r"|\((\d+(?:\.\d+)?)\s*ms\)"
+)
+API_ERROR_PATTERN = re.compile(
+    r'''(?i:\berrorCode\s*[:=]\s*["']?)([A-Z][A-Z0-9_-]{1,63})'''
+)
+API_BODY_ERROR_PATTERN = re.compile(
+    r'''(?i:"errorCode"\s*:\s*")([A-Z][A-Z0-9_-]{1,63})'''
+)
+WEBHOOK_PAYLOAD_MARKER = re.compile(r"(?i)\bExternal ReverseMapping Payload\s*:")
+MAX_API_METADATA_PREFIX = 4096
 
 
 def classify_lead_event(entry: dict) -> str:
+    api_metadata = entry.get("leadApiMetadata")
+    if api_metadata:
+        status = api_metadata.get("httpStatus")
+        if status is not None and status >= 400:
+            return "FAILURE"
+        return "EXTERNAL_API"
     message = entry.get("message") or ""
     logger = entry.get("logger") or ""
     combined = f"{logger} {message}"
@@ -194,9 +225,7 @@ def _entry_key(entry: dict) -> tuple[str, str]:
 
 
 def matched_lead_aliases(entry: dict, lead_id: str) -> list[str]:
-    text = "\n".join(
-        value for value in (entry.get("raw"), entry.get("message")) if isinstance(value, str)
-    )
+    text = entry.get("message") or entry.get("raw") or ""
     matched = set()
     for match in LEAD_FIELD.finditer(text):
         value = next((group for group in match.groups()[1:] if group is not None), None)
@@ -204,6 +233,105 @@ def matched_lead_aliases(entry: dict, lead_id: str) -> list[str]:
             alias = match.group(1).casefold()
             matched.add(next(name for name in LEAD_ALIASES if name.casefold() == alias))
     return [alias for alias in LEAD_ALIASES if alias in matched]
+
+
+def compact_large_api_entry(entry: dict) -> dict:
+    message = entry.get("message") or ""
+    prefix = message[:MAX_API_METADATA_PREFIX]
+    logger = entry.get("logger") or ""
+    webhook_match = WEBHOOK_PAYLOAD_MARKER.search(prefix)
+    metadata_prefix = prefix.splitlines()[0]
+    body_positions = [position for position in (metadata_prefix.find("{"),) if position >= 0]
+    body_start = body_positions[0] if body_positions else None
+    if webhook_match:
+        marker_end = webhook_match.end()
+        array_start = metadata_prefix.find("[", marker_end)
+        if array_start >= 0:
+            body_positions.append(array_start)
+    if body_positions:
+        metadata_prefix = metadata_prefix[:min(body_positions)]
+    endpoint_match = API_ENDPOINT_PATTERN.search(metadata_prefix)
+    operation_match = (
+        LARGE_API_OPERATION.search(metadata_prefix)
+        or LARGE_API_OPERATION.search(logger)
+    )
+    operation = operation_match.group(1) if operation_match else None
+    endpoint = endpoint_match.group("path") if endpoint_match else None
+    if endpoint:
+        known_match = next(
+            ((known_endpoint, name) for known_endpoint, name in LARGE_API_ENDPOINTS.items()
+             if endpoint.startswith(known_endpoint)),
+            None,
+        )
+        if known_match:
+            endpoint, operation = known_match
+    if not webhook_match and not operation and not endpoint:
+        return entry
+
+    method_match = API_METHOD_PATTERN.search(metadata_prefix)
+    if webhook_match:
+        event_type = "WEBHOOK_RECEIVED"
+    else:
+        lowered = metadata_prefix.casefold()
+        is_response = (
+            "<---" in metadata_prefix
+            or re.search(r"\bresponse\b", lowered)
+            or API_STATUS_PATTERN.search(metadata_prefix)
+            or re.search(r"\(\d+(?:\.\d+)?\s*ms\)", metadata_prefix)
+        )
+        is_request = (
+            "--->" in metadata_prefix
+            or re.search(r"\brequest\b", lowered)
+            or (method_match and (endpoint_match or operation))
+        )
+        if is_response:
+            event_type = "API_RESPONSE"
+        elif is_request:
+            event_type = "API_REQUEST"
+        else:
+            event_type = None
+
+    status_match = API_STATUS_PATTERN.search(metadata_prefix)
+    duration_match = API_DURATION_PATTERN.search(metadata_prefix)
+    error_match = API_ERROR_PATTERN.search(metadata_prefix)
+    if not error_match and body_start is not None:
+        error_match = API_BODY_ERROR_PATTERN.search(prefix[body_start:body_start + 512])
+    duration_value = None
+    if duration_match:
+        value = duration_match.group(1) or duration_match.group(2)
+        numeric_duration = float(value)
+        duration_value = int(numeric_duration) if numeric_duration.is_integer() else numeric_duration
+    metadata = {
+        "eventType": event_type,
+        "operation": operation,
+        "httpMethod": method_match.group(1).upper() if method_match else None,
+        "endpointPath": endpoint,
+        "httpStatus": int(status_match.group(1)) if status_match else None,
+        "durationMs": duration_value,
+        "errorCode": error_match.group(1) if error_match else None,
+        "payloadOmitted": True,
+    }
+    safe_message = (
+        f"Large API payload omitted: {event_type or 'API_EVENT_TYPE_UNKNOWN'}"
+        + (f" operation={operation}" if operation else "")
+        + (f" method={metadata['httpMethod']}" if metadata["httpMethod"] else "")
+        + (f" endpoint={endpoint}" if endpoint else "")
+        + (f" status={metadata['httpStatus']}" if metadata["httpStatus"] is not None else "")
+        + (f" durationMs={duration_value}" if duration_value is not None else "")
+        + (f" errorCode={metadata['errorCode']}" if metadata["errorCode"] else "")
+    )
+    compacted = dict(entry)
+    compacted["message"] = safe_message
+    request_id = extract_request_id(entry) or ""
+    compacted["raw"] = (
+        f"{entry.get('applicationTimestamp') or entry.get('timestamp')} "
+        f"[{entry.get('thread') or 'unknown'}] {entry.get('level') or 'INFO'} "
+        f"[{request_id},[REDACTED]] [{entry.get('pid') or 'unknown'}] --- "
+        f"{logger or 'unknown'} : {safe_message}"
+    )
+    compacted["exception"] = None
+    compacted["leadApiMetadata"] = metadata
+    return compacted
 
 
 def _query_pattern(lead_id: str) -> str:
@@ -222,19 +350,21 @@ async def _bounded_loki_query(
     end: datetime,
     total_limit: int,
     max_queries: int | None = None,
+    entry_processor=None,
 ) -> tuple[list[dict], dict]:
     page_size = max(1, min(config.LEAD_LOKI_PAGE_SIZE, total_limit, 5000))
     query_limit = max(0, config.LEAD_MAX_LOKI_QUERIES if max_queries is None else max_queries)
     found: list[dict] = []
+    retrieved_count = 0
     query_count = 0
     truncated = False
 
     async def read_range(range_start: datetime, range_end: datetime) -> None:
-        nonlocal query_count, truncated
-        if len(found) >= total_limit or query_count >= query_limit:
+        nonlocal query_count, retrieved_count, truncated
+        if retrieved_count >= total_limit or query_count >= query_limit:
             truncated = True
             return
-        remaining = total_limit - len(found)
+        remaining = total_limit - retrieved_count
         requested_limit = min(page_size, remaining)
         query_count += 1
         duration_minutes = max(1, math.ceil((range_end - range_start).total_seconds() / 60))
@@ -245,12 +375,16 @@ async def _bounded_loki_query(
             window_start=range_start,
             window_end=range_end,
         )
-        found.extend(entries[:remaining])
+        for entry in entries[:remaining]:
+            retrieved_count += 1
+            processed = entry_processor(entry) if entry_processor else entry
+            if processed is not None:
+                found.append(processed)
         saturated = len(entries) >= requested_limit
         if not saturated:
             return
         span = (range_end - range_start).total_seconds()
-        if span <= 1 or len(found) >= total_limit or query_count >= query_limit:
+        if span <= 1 or retrieved_count >= total_limit or query_count >= query_limit:
             truncated = True
             return
         midpoint = range_start + (range_end - range_start) / 2
@@ -263,7 +397,7 @@ async def _bounded_loki_query(
     await read_range(start, end)
     return found, {
         "queryCount": query_count,
-        "returnedLines": len(found),
+        "returnedLines": retrieved_count,
         "truncated": truncated,
         "lineLimit": total_limit,
         "pageSize": page_size,
@@ -290,18 +424,26 @@ async def investigate_lead(
 
     selector = selector_for_environment(environment)
     candidate_query = selector + " |~ " + json.dumps(_query_pattern(lead_id))
+
+    def prepare_candidate(entry: dict) -> dict | None:
+        aliases = matched_lead_aliases(entry, lead_id)
+        if not aliases:
+            return None
+        compacted = compact_large_api_entry(entry)
+        compacted["_matchedLeadAliases"] = aliases
+        return compacted
+
     candidate_lines, candidate_stats = await _bounded_loki_query(
         candidate_query,
         window_start,
         window_end,
         max(1, config.LEAD_MAX_RETRIEVED_LINES),
+        entry_processor=prepare_candidate,
     )
     discovery_finished = time.perf_counter()
     candidate_by_key = {}
     for entry in candidate_lines:
-        aliases = matched_lead_aliases(entry, lead_id)
-        if not aliases:
-            continue
+        aliases = entry.pop("_matchedLeadAliases")
         key = _entry_key(entry)
         candidate_by_key.setdefault(key, {"entry": entry, "aliases": set()})["aliases"].update(aliases)
 
@@ -347,6 +489,7 @@ async def investigate_lead(
                 window_end,
                 remaining_line_budget,
                 max_queries=max(0, config.LEAD_MAX_LOKI_QUERIES - candidate_stats["queryCount"]),
+                entry_processor=compact_large_api_entry,
             )
             timeline_lines = [
                 entry for entry in timeline_lines
@@ -416,6 +559,14 @@ async def investigate_lead(
             "matchedAliases": row["matchedAliases"],
             "raw": entry.get("raw", ""),
             "message": entry.get("message", ""),
+            "eventType": (entry.get("leadApiMetadata") or {}).get("eventType"),
+            "payloadOmitted": bool((entry.get("leadApiMetadata") or {}).get("payloadOmitted")),
+            "apiOperation": (entry.get("leadApiMetadata") or {}).get("operation"),
+            "httpMethod": (entry.get("leadApiMetadata") or {}).get("httpMethod"),
+            "endpointPath": (entry.get("leadApiMetadata") or {}).get("endpointPath"),
+            "httpStatus": (entry.get("leadApiMetadata") or {}).get("httpStatus"),
+            "durationMs": (entry.get("leadApiMetadata") or {}).get("durationMs"),
+            "errorCode": (entry.get("leadApiMetadata") or {}).get("errorCode"),
         })
 
     request_timelines = []
@@ -449,6 +600,10 @@ async def investigate_lead(
                 aliases_by_request_id.get(extract_request_id(entry), set())
             )
             event["eventCategory"] = classify_lead_event(entry)
+            api_metadata = entry.get("leadApiMetadata")
+            if api_metadata:
+                event["eventType"] = api_metadata["eventType"]
+                event.update(api_metadata)
         request_timelines.append(timeline)
 
     aliases_observed = sorted({
@@ -501,10 +656,20 @@ def build_lead_ai_context(investigation: dict) -> tuple[str, set[str], bool]:
     omitted_refs = []
     for item in investigation["evidence"]:
         allowed_refs.add(item["evidenceRef"])
-        message = redact_lead_evidence_text(
-            item["message"],
-            policy=EXTERNAL_AI,
-        )
+        if item.get("payloadOmitted"):
+            message = json.dumps({
+                key: item.get(key)
+                for key in (
+                    "eventType", "apiOperation", "httpMethod", "endpointPath",
+                    "httpStatus", "durationMs", "errorCode", "payloadOmitted",
+                )
+                if item.get(key) is not None
+            }, ensure_ascii=True, separators=(",", ":"))
+        else:
+            message = redact_lead_evidence_text(
+                item["message"],
+                policy=EXTERNAL_AI,
+            )
         if message == "[UNSAFE_PAYLOAD_OMITTED]":
             message = ""
             omitted_refs.append(item["evidenceRef"])

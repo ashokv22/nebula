@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -58,6 +59,106 @@ class LeadIntelligenceTests(unittest.TestCase):
         entry = parser.parse_entry("1792761601000000000", raw)
         self.assertIsNone(entry["request_id"])
         self.assertEqual(parser.extract_request_id(entry), "Req_1234")
+
+    def test_large_feign_and_webhook_payloads_are_compacted_before_response_and_ai(self):
+        body_marker = "SYNTHETIC_PRIVATE_BODY_MARKER"
+        huge_body = json.dumps({
+            "leadId": "2977",
+            "customerName": body_marker,
+            "address": "SYNTHETIC_ADDRESS",
+            "payload": "x" * 400_000,
+        })
+        response_body = json.dumps({
+            "leadId": "2977",
+            "errorCode": "ER021",
+            "payload": "x" * 400_000,
+        })
+        lines = [
+            self.entry(
+                1,
+                "saveLoan request: POST /v2/partner/loanApplications "
+                '{"leadId":"2977"} body=' + huge_body,
+            ),
+            self.entry(
+                2,
+                "getLoanStatus response: GET /v1/partner/loanReports/2977 "
+                "HTTP/1.1 200 (125ms) " + response_body,
+            ),
+            self.entry(
+                3,
+                "External ReverseMapping Payload: "
+                '{"leadId":"2977"} ' + huge_body,
+            ),
+        ]
+
+        async def fake_loki(query, *args, **kwargs):
+            return lines
+
+        with (
+            patch("lens.lead_service.loki_query", new=AsyncMock(side_effect=fake_loki)),
+            patch.object(config, "LEAD_MAX_REQUEST_IDS", 20),
+            patch.dict("os.environ", {"API_TOKEN": "synthetic-pseudonym-key"}),
+        ):
+            result = asyncio.run(lead_service.investigate_lead("2977", "uat", 7))
+            ai_context, _, _ = lead_service.build_lead_ai_context(result)
+
+        serialized = json.dumps(result)
+        self.assertNotIn(body_marker, serialized)
+        self.assertNotIn("SYNTHETIC_ADDRESS", serialized)
+        self.assertNotIn(body_marker, ai_context)
+        self.assertNotIn("SYNTHETIC_ADDRESS", ai_context)
+        self.assertLess(len(serialized), 20_000)
+        self.assertEqual(result["candidateCount"], 3)
+        evidence_by_type = {item["eventType"]: item for item in result["evidence"]}
+        self.assertEqual(
+            set(evidence_by_type),
+            {"API_REQUEST", "API_RESPONSE", "WEBHOOK_RECEIVED"},
+        )
+        request = evidence_by_type["API_REQUEST"]
+        self.assertTrue(request["payloadOmitted"])
+        self.assertEqual(request["apiOperation"], "saveLoan")
+        self.assertEqual(request["httpMethod"], "POST")
+        self.assertEqual(request["endpointPath"], "/v2/partner/loanApplications")
+        self.assertIsNone(request["httpStatus"])
+        self.assertIsNone(request["durationMs"])
+        response = evidence_by_type["API_RESPONSE"]
+        self.assertEqual(response["httpStatus"], 200)
+        self.assertEqual(response["durationMs"], 125)
+        self.assertEqual(response["errorCode"], "ER021")
+        self.assertEqual(response["apiOperation"], "getLoanStatus")
+        webhook = evidence_by_type["WEBHOOK_RECEIVED"]
+        self.assertTrue(webhook["payloadOmitted"])
+        self.assertIsNone(webhook["httpStatus"])
+        self.assertTrue(all(item["requestId"] == "Req_1234" for item in result["evidence"]))
+        self.assertTrue(all(item["eventCategory"] == "EXTERNAL_API" for item in result["evidence"]))
+        self.assertTrue(all(item["evidenceRef"] for item in result["evidence"]))
+        self.assertEqual(
+            sum(item["eventCategory"] == "BUSINESS_ACTION" for item in result["evidence"]),
+            0,
+        )
+        timeline_events = result["requestTimelines"][0]["events"]
+        self.assertEqual(
+            {event["eventType"] for event in timeline_events},
+            {"API_REQUEST", "API_RESPONSE", "WEBHOOK_RECEIVED"},
+        )
+        self.assertTrue(all(body_marker not in event["raw"] for event in timeline_events))
+        self.assertEqual(
+            {event["evidenceRef"] for event in timeline_events},
+            {item["evidenceRef"] for item in result["evidence"]},
+        )
+
+    def test_unrecognized_request_timeline_entries_are_not_compacted(self):
+        entry = self.entry(1, "ordinary application diagnostic without an API payload")
+        self.assertIs(lead_service.compact_large_api_entry(entry), entry)
+
+    def test_known_operation_with_unknown_event_direction_still_omits_body(self):
+        body = '{"leadId":"2977","customerName":"SYNTHETIC_PRIVATE_VALUE","payload":"' + "x" * 5000 + '"}'
+        entry = self.entry(1, "saveLoan operation: " + body)
+        compacted = lead_service.compact_large_api_entry(entry)
+        self.assertTrue(compacted["leadApiMetadata"]["payloadOmitted"])
+        self.assertIsNone(compacted["leadApiMetadata"]["eventType"])
+        self.assertNotIn("SYNTHETIC_PRIVATE_VALUE", compacted["raw"])
+        self.assertNotIn("SYNTHETIC_PRIVATE_VALUE", compacted["message"])
 
     def test_sensitive_customer_fields_are_redacted_from_raw_and_message(self):
         message = (
