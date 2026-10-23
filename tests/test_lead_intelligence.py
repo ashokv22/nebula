@@ -51,6 +51,98 @@ class LeadIntelligenceTests(unittest.TestCase):
         ):
             return asyncio.run(analyzer.call_lead_groq("{}"))
 
+    @staticmethod
+    def valid_lead_model_output():
+        return {
+            "narrative": "A candidate event was observed.",
+            "latestObservedActivity": None,
+            "currentStage": None,
+            "summaryEvidenceRefs": ["evidence-1"],
+            "stageEvidenceRefs": [],
+            "confidence": "low",
+            "journeyTimeline": [{
+                "event": "Candidate event",
+                "description": "A candidate event was observed.",
+                "evidenceRefs": ["evidence-1"],
+            }],
+            "findingsAndAnomalies": [],
+            "rootCauseAssessment": {
+                "observedFacts": [],
+                "possibleCauses": [],
+                "confidence": "low",
+            },
+            "suggestedChecks": [],
+            "recommendedNextSteps": [],
+            "limitations": [],
+            "model": config.GROQ_MODEL,
+        }
+
+    def test_lead_model_rejects_reported_schema_mismatch_and_accepts_valid_shape(self):
+        invalid = self.valid_lead_model_output()
+        invalid["summaryEvidenceRefs"] = [f"evidence-{index}" for index in range(6)]
+        invalid["stageEvidenceRefs"] = "evidence-1"
+        invalid["journeyTimeline"] = [{
+            "event": f"event-{index}",
+            "evidenceRefs": ["evidence-1"],
+            "timestamp": "unrequested",
+            "requestId": "unrequested",
+        } for index in range(6)]
+        invalid["suggestedChecks"] = [{
+            "action": "UNSAFE_NAVIGATION",
+            "title": "Go somewhere",
+            "reason": "Unsupported action",
+            "priority": "low",
+            "evidenceRefs": ["evidence-1"],
+        }]
+        with self.assertRaises(ValidationError) as raised:
+            schemas.LeadIntelligenceModel.model_validate(invalid)
+
+        errors = raised.exception.errors()
+        locations = [error["loc"] for error in errors]
+        self.assertIn(("summaryEvidenceRefs",), locations)
+        self.assertIn(("stageEvidenceRefs",), locations)
+        self.assertIn(("journeyTimeline", 0, "description"), locations)
+        self.assertIn(("journeyTimeline", 0, "timestamp"), locations)
+        self.assertIn(("journeyTimeline", 0, "requestId"), locations)
+        self.assertIn(("suggestedChecks", 0, "action"), locations)
+
+        valid = schemas.LeadIntelligenceModel.model_validate(self.valid_lead_model_output())
+        self.assertEqual(valid.stageEvidenceRefs, [])
+        self.assertEqual(valid.journeyTimeline[0].model_dump(), {
+            "description": "A candidate event was observed.",
+            "evidenceRefs": ["evidence-1"],
+            "event": "Candidate event",
+        })
+
+    def test_lead_prompt_includes_authoritative_model_schema(self):
+        provider_response = SimpleNamespace(
+            status_code=200,
+            raise_for_status=lambda: None,
+            json=lambda: {"choices": [{
+                "message": {"content": json.dumps(self.valid_lead_model_output())},
+                "finish_reason": "stop",
+            }]},
+        )
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.post = AsyncMock(return_value=provider_response)
+        with (
+            patch("lens.analyzer.httpx.AsyncClient", return_value=client),
+            patch.dict("os.environ", {"API_TOKEN": "synthetic-token"}),
+        ):
+            result = asyncio.run(analyzer.call_lead_groq("{}"))
+
+        sent = client.post.await_args.kwargs["json"]
+        system_prompt = sent["messages"][0]["content"]
+        schema = json.dumps(
+            schemas.LeadIntelligenceModel.model_json_schema(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        self.assertIn(schema, system_prompt)
+        self.assertEqual(result["journeyTimeline"][0]["description"], "A candidate event was observed.")
+
     def test_groq_diagnostics_identify_model_validation_fields_without_input_values(self):
         unsafe_value = "SYNTHETIC_PRIVATE_CUSTOMER_VALUE"
         content = json.dumps({

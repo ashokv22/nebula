@@ -489,6 +489,11 @@ async def call_lead_groq(context: str) -> dict:
     token = os.getenv("API_TOKEN")
     if not token:
         raise HTTPException(status_code=503, detail="AI analysis is unavailable: API_TOKEN is not configured")
+    lead_output_schema = json.dumps(
+        LeadIntelligenceModel.model_json_schema(),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
     payload = {
         "model": GROQ_MODEL,
         "messages": [
@@ -503,13 +508,23 @@ async def call_lead_groq(context: str) -> dict:
                     "not proof of a successful business submission. Lack of recent logs does "
                     "not mean a lead is stuck. When identifierCorrelation is ambiguous, treat "
                     "each alias-associated set of evidence as a separate candidate and never "
-                    "combine claims across aliases. State uncertainty and limitations. Return the "
-                    "fields: narrative, latestObservedActivity, currentStage, summaryEvidenceRefs, "
-                    "stageEvidenceRefs, confidence, journeyTimeline, findingsAndAnomalies, "
-                    "rootCauseAssessment, suggestedChecks, recommendedNextSteps, limitations, "
-                    "model. All factual summary claims and recommended next steps cite evidenceRefs. "
-                    "Suggested checks use only REQUEST_INVESTIGATION, LEAD_HISTORY, USER_ACTIVITY, "
-                    "EXTERNAL_API_INSPECTION, or COMPARE_ATTEMPTS and cite evidenceRefs."
+                    "combine claims across aliases. State uncertainty and limitations. Output only "
+                    "the JSON object matching the supplied schema, with exactly its keys and types. "
+                    "Every evidenceRefs value must come from supplied evidence. The narrative and "
+                    "latestObservedActivity cite through summaryEvidenceRefs; currentStage is "
+                    "allowed only when supported by stageEvidenceRefs; recommendedNextSteps cite "
+                    "their evidenceRefs. Use empty arrays for unavailable evidence; summaryEvidenceRefs and "
+                    "stageEvidenceRefs must be arrays containing only supplied evidenceRefs, and "
+                    "stageEvidenceRefs must be empty when no stage is supported. Each journeyTimeline "
+                    "item must include exactly event, description, and evidenceRefs. Each suggested "
+                    "check must use an allowed action and cite supplied evidenceRefs; include a check "
+                    "only when the retrieved evidence supports its required navigation context: "
+                    "REQUEST_INVESTIGATION and EXTERNAL_API_INSPECTION require evidence with a "
+                    "request ID; USER_ACTIVITY requires evidence with a username; LEAD_HISTORY "
+                    "and COMPARE_ATTEMPTS use the lead context. Do not add fields, infer IDs, or "
+                    "fabricate supporting evidence. The server constructs navigation context from "
+                    "validated evidence. Schema: "
+                    + lead_output_schema
                 ),
             },
             {
