@@ -697,7 +697,11 @@ async def call_lead_groq(context: str) -> dict:
                     "request ID; USER_ACTIVITY requires evidence with a username; LEAD_HISTORY "
                     "and COMPARE_ATTEMPTS use the lead context. Do not add fields, infer IDs, or "
                     "fabricate supporting evidence. The server constructs navigation context from "
-                    "validated evidence. Use the schema below as instructions only; do not output "
+                    "validated evidence. Every suggestedChecks item MUST include all required "
+                    "schema fields: title, action, priority, reason, and evidenceRefs. The title "
+                    "must be a short, meaningful, human-readable label appropriate for a Horizon "
+                    "quick action. Do not omit title even when other fields are present. Use the "
+                    "schema below as instructions only; do not output "
                     "the schema, a wrapper containing the schema, or any text outside the single "
                     "response object. Schema: "
                     + lead_output_schema

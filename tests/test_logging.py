@@ -21,7 +21,19 @@ class LoggingConfigurationTests(unittest.TestCase):
 
                 log_path = Path(sys.argv[1])
                 console = io.StringIO()
+                uvicorn_access = logging.getLogger("uvicorn.access")
+                uvicorn_access.addHandler(logging.StreamHandler(io.StringIO()))
+                uvicorn_access.propagate = False
+                uvicorn_child = logging.getLogger("uvicorn.protocols.http")
+                uvicorn_child.addHandler(logging.StreamHandler(io.StringIO()))
+                uvicorn_child.propagate = False
                 configure_logging(str(log_path), console)
+                configure_logging(str(log_path), console)
+                assert len(logging.getLogger().handlers) == 2
+                assert not uvicorn_access.handlers
+                assert not uvicorn_child.handlers
+                assert uvicorn_access.propagate
+                assert uvicorn_child.propagate
                 logger = logging.getLogger("smoke.application")
                 logger.debug("debug-only")
                 logger.info("visible-info")
@@ -47,7 +59,9 @@ class LoggingConfigurationTests(unittest.TestCase):
                 log_path.rename(old_path)
                 logger.info("after-external-rotation")
                 assert "after-external-rotation" in log_path.read_text()
+                assert log_path.read_text().count("after-external-rotation") == 1
                 assert "debug-only" in old_path.read_text()
+                assert old_path.read_text().count("debug-only") == 1
                 assert "SYNTHETIC_PRIVATE_EXCEPTION_VALUE" not in old_path.read_text()
                 assert "ValueError" in old_path.read_text()
                 assert "2977" not in old_path.read_text()

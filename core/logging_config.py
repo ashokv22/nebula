@@ -62,8 +62,16 @@ def configure_logging(
     root.addHandler(file_handler)
     root.addHandler(console_handler)
 
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-        logger = logging.getLogger(name)
+    uvicorn_loggers = {
+        "uvicorn": logging.getLogger("uvicorn"),
+        "uvicorn.error": logging.getLogger("uvicorn.error"),
+        "uvicorn.access": logging.getLogger("uvicorn.access"),
+    }
+    for name, registered in root.manager.loggerDict.items():
+        if name.startswith("uvicorn.") and isinstance(registered, logging.Logger):
+            uvicorn_loggers[name] = registered
+
+    for logger in uvicorn_loggers.values():
         for handler in logger.handlers[:]:
             logger.removeHandler(handler)
             handler.close()

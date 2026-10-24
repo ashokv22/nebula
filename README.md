@@ -48,8 +48,11 @@ large result sets there can be truncated.
 
 The FastAPI app configures a DEBUG-level `WatchedFileHandler` at
 `/var/log/nebula/nebula.log` and an INFO-level console handler. Uvicorn loggers
-propagate to those handlers to avoid duplicate records. HTTPX wire logging is
-kept at WARNING. Exception traces include exception type and frame locations,
+and descendants have their handlers cleared and propagate once to the root
+handlers to avoid duplicate records. Keep the FastAPI systemd unit's
+`StandardOutput` and `StandardError` directed to journald; do not append the
+console stream to `/var/log/nebula/nebula.log`, or it will duplicate the file
+handler's records. HTTPX wire logging is kept at WARNING. Exception traces include exception type and frame locations,
 not exception messages or source lines. Loki logs record duration and result
 count without logging the query; Groq provider diagnostics log only allowlisted
 error type, parameter, and code values.

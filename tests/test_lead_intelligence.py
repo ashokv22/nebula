@@ -143,6 +143,9 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertIn(schema, system_prompt)
         self.assertIn("do not output the schema", system_prompt)
         self.assertIn("single response object", system_prompt)
+        self.assertIn("Every suggestedChecks item MUST include", system_prompt)
+        self.assertIn("title, action, priority, reason, and evidenceRefs", system_prompt)
+        self.assertIn("Horizon quick action", system_prompt)
         response_format = sent["response_format"]
         self.assertEqual(response_format["type"], "json_schema")
         self.assertTrue(response_format["json_schema"]["strict"])
@@ -153,6 +156,29 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertEqual(sent["max_completion_tokens"], 1800)
         self.assertNotIn("temperature", sent)
         self.assertEqual(result["journeyTimeline"][0]["description"], "A candidate event was observed.")
+
+    def test_lead_groq_rejects_suggested_checks_missing_title(self):
+        output = self.valid_lead_model_output()
+        output["suggestedChecks"] = [{
+            "action": "REQUEST_INVESTIGATION",
+            "priority": "medium",
+            "reason": "Inspect the supported request.",
+            "evidenceRefs": ["evidence-1"],
+        }, {
+            "action": "LEAD_HISTORY",
+            "priority": "low",
+            "reason": "Review the lead history.",
+            "evidenceRefs": ["evidence-1"],
+        }]
+        with self.assertLogs("lens.analyzer", level="WARNING") as captured:
+            with self.assertRaises(HTTPException):
+                self.call_lead_groq_with_content(json.dumps(output))
+
+        diagnostic = captured.records[0].lead_ai_diagnostic
+        self.assertEqual(diagnostic["stage"], "pydantic_validation")
+        self.assertIn("suggestedChecks.0.title", diagnostic["field_paths"])
+        self.assertIn("suggestedChecks.1.title", diagnostic["field_paths"])
+        self.assertEqual(diagnostic["invalid_suggested_check_count"], 2)
 
     def test_lead_provider_schema_enforces_object_roots_and_complete_nested_shapes(self):
         schema = analyzer._lead_groq_json_schema()
