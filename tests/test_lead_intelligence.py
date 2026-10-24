@@ -167,6 +167,48 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertNotIn("temperature", sent)
         self.assertEqual(result["journeyTimeline"][0]["description"], "A candidate event was observed.")
 
+    def test_groq_exchange_logs_safe_metadata_without_prompt_or_completion_content(self):
+        private_marker = "SYNTHETIC_PRIVATE_GROQ_CONTENT"
+        output = self.valid_lead_model_output()
+        output["narrative"] = private_marker
+        provider_response = SimpleNamespace(
+            status_code=200,
+            raise_for_status=lambda: None,
+            json=lambda: {
+                "choices": [{
+                    "message": {"content": json.dumps(output)},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+            },
+        )
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.post = AsyncMock(return_value=provider_response)
+        context = json.dumps({
+            "evidence": [{
+                "evidenceRef": "evidence-1",
+                "hasRequestId": True,
+                "hasUsername": True,
+                "message": private_marker,
+            }],
+        })
+        with (
+            self.assertLogs("lens.analyzer", level="DEBUG") as captured,
+            patch("lens.analyzer.httpx.AsyncClient", return_value=client),
+            patch.dict("os.environ", {"API_TOKEN": "synthetic-token"}),
+        ):
+            asyncio.run(analyzer.call_lead_groq(context))
+
+        logs = "\n".join(record.getMessage() for record in captured.records)
+        self.assertIn("Groq request metadata", logs)
+        self.assertIn("Groq response metadata", logs)
+        self.assertIn("parsed response shape", logs)
+        self.assertIn('"prompt_tokens":12', logs)
+        self.assertIn('"completion_tokens":8', logs)
+        self.assertNotIn(private_marker, logs)
+
     def test_lead_ai_normalization_handles_null_missing_and_unsafe_checks(self):
         context = json.dumps({
             "evidence": [{
@@ -221,13 +263,17 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertIsNone(validated.rootCauseAssessment)
         self.assertEqual(validated.recommendedNextSteps, [])
         self.assertEqual(validated.limitations, [])
-        self.assertEqual(len(validated.suggestedChecks), 1)
+        self.assertEqual(len(validated.suggestedChecks), 2)
         self.assertEqual(validated.suggestedChecks[0].title, "Investigate request")
         self.assertEqual(validated.suggestedChecks[0].reason, "")
         self.assertEqual(validated.suggestedChecks[0].priority, "low")
-        self.assertEqual(validated.suggestedChecks[0].evidenceRefs, ["evidence-valid"])
+        self.assertEqual(
+            validated.suggestedChecks[0].evidenceRefs,
+            ["evidence-valid", "not-in-context"],
+        )
+        self.assertEqual(validated.suggestedChecks[1].evidenceRefs, ["not-in-context"])
 
-    def test_lead_ai_normalization_discards_unreferenced_claims_and_empty_output_is_valid(self):
+    def test_lead_ai_normalization_preserves_string_references_for_canonical_validation(self):
         context = json.dumps({"evidence": [{"evidenceRef": "evidence-1"}]})
         normalized = analyzer._normalize_lead_ai_output({
             "narrative": "Unsupported summary",
@@ -247,11 +293,9 @@ class LeadIntelligenceTests(unittest.TestCase):
             }],
         }, context)
         validated = schemas.LeadIntelligenceModel.model_validate(normalized)
-        self.assertEqual(validated.narrative, "")
-        self.assertEqual(validated.summaryEvidenceRefs, [])
-        self.assertIsNone(validated.confidence)
-        self.assertIsNone(validated.rootCauseAssessment)
-        self.assertEqual(validated.journeyTimeline, [])
+        self.assertEqual(validated.narrative, "Unsupported summary")
+        self.assertEqual(validated.summaryEvidenceRefs, ["unknown-ref"])
+        self.assertEqual(validated.journeyTimeline[0].evidenceRefs, ["unknown-ref"])
         self.assertEqual(validated.findingsAndAnomalies, [])
         self.assertEqual(validated.recommendedNextSteps, [])
 
@@ -1090,15 +1134,14 @@ class LeadIntelligenceTests(unittest.TestCase):
 
         base["suggestedChecks"][0]["evidenceRefs"] = []
         with self.assertLogs("lens.analyzer", level="WARNING") as captured:
-            with self.assertRaises(HTTPException) as raised:
-                lead_service.validate_lead_analysis(base, investigation, {"evidence-1"})
-        self.assertEqual(raised.exception.status_code, 502)
+            result = lead_service.validate_lead_analysis(base, investigation, {"evidence-1"})
+        self.assertEqual(result["suggestedChecks"], [])
         message = captured.records[0].getMessage()
         self.assertIn('"stage":"evidence_reference_validation"', message)
         diagnostic = json.loads(message.split(" diagnostic ", 1)[1])
         self.assertEqual(diagnostic["stage"], "evidence_reference_validation")
-        self.assertEqual(diagnostic["validation_reason"], "missing_references")
-        self.assertEqual(diagnostic["invalid_reference_count"], 0)
+        self.assertEqual(diagnostic["removed_claim_count"], 1)
+        self.assertEqual(diagnostic["remaining_validated_findings"], 0)
 
     def test_ai_claim_cannot_combine_ambiguous_alias_groups(self):
         investigation = {
@@ -1126,9 +1169,112 @@ class LeadIntelligenceTests(unittest.TestCase):
             "suggestedChecks": [], "recommendedNextSteps": [], "limitations": [],
             "model": config.GROQ_MODEL,
         }
-        with self.assertRaises(HTTPException) as raised:
-            lead_service.validate_lead_analysis(result, investigation, {"evidence-1", "evidence-2"})
+        with self.assertLogs("lens.analyzer", level="WARNING") as captured:
+            partial = lead_service.validate_lead_analysis(
+                result, investigation, {"evidence-1", "evidence-2"}
+            )
+        self.assertEqual(partial["journeyTimeline"], [])
+        self.assertEqual(
+            partial["leadSummary"]["latestActivityEvidence"][0]["evidenceRef"],
+            "evidence-1",
+        )
+        self.assertTrue(any("not confirmed as the same lead" in item for item in partial["limitations"]))
+        diagnostic = json.loads(captured.records[0].getMessage().split(" diagnostic ", 1)[1])
+        self.assertEqual(diagnostic["ambiguous_claim_count"], 1)
+        self.assertEqual(diagnostic["ambiguous_reference_count"], 2)
+        self.assertEqual(diagnostic["removed_claim_count"], 1)
+
+    def test_invalid_evidence_references_are_classified_and_valid_refs_preserved(self):
+        investigation = {
+            "leadId": "L-1",
+            "environment": "uat",
+            "relatedRequestIds": ["Req_1234"],
+            "evidence": [
+                {
+                    "evidenceRef": "evidence-1", "timestamp": "2026-10-23T12:00:00+00:00",
+                    "requestId": "Req_1234", "username": None, "matchedAliases": ["leadId"],
+                    "message": "Request failure",
+                },
+                {
+                    "evidenceRef": "evidence-2", "timestamp": "2026-10-23T12:00:01+00:00",
+                    "requestId": "Req_1234", "username": None, "matchedAliases": ["leadId"],
+                    "message": "Another failure",
+                },
+            ],
+            "retrieval": {"identifierCorrelation": "candidate"},
+            "limitations": [],
+        }
+        result = {
+            "narrative": "A request failure was observed.",
+            "latestObservedActivity": None, "currentStage": None,
+            "summaryEvidenceRefs": ["evidence-1"], "stageEvidenceRefs": [],
+            "confidence": "medium",
+            "journeyTimeline": [],
+            "findingsAndAnomalies": [
+                {"description": "One valid request failure.", "evidenceRefs": [
+                    "evidence-1", "bad-reference", "evidence-999",
+                ]},
+                {"description": "Malformed only.", "evidenceRefs": ["bad-reference"]},
+                {"description": "Nonexistent only.", "evidenceRefs": ["evidence-999"]},
+                {"description": "Not in AI context.", "evidenceRefs": ["evidence-2"]},
+            ],
+            "rootCauseAssessment": None,
+            "suggestedChecks": [{
+                "action": "LEAD_HISTORY", "title": "Review history", "reason": "",
+                "priority": "low", "evidenceRefs": ["evidence-2"],
+            }],
+            "recommendedNextSteps": [],
+            "limitations": [], "model": config.GROQ_MODEL,
+        }
+        with self.assertLogs("lens.analyzer", level="WARNING") as captured:
+            response = lead_service.validate_lead_analysis(
+                result, investigation, {"evidence-1"}
+            )
+        self.assertEqual(len(response["findingsAndAnomalies"]), 1)
+        self.assertEqual(
+            response["findingsAndAnomalies"][0]["supportingEvidence"][0]["evidenceRef"],
+            "evidence-1",
+        )
+        self.assertEqual(response["suggestedChecks"], [])
+        diagnostic = json.loads(captured.records[0].getMessage().split(" diagnostic ", 1)[1])
+        self.assertEqual(diagnostic["malformed_reference_count"], 2)
+        self.assertEqual(diagnostic["nonexistent_reference_count"], 2)
+        self.assertEqual(diagnostic["reference_not_in_context_count"], 2)
+        self.assertEqual(diagnostic["invalid_reference_count"], 6)
+        self.assertGreaterEqual(diagnostic["removed_claim_count"], 3)
+        self.assertEqual(diagnostic["remaining_validated_findings"], 1)
+
+    def test_completely_unusable_ai_analysis_returns_safe_error(self):
+        investigation = {
+            "leadId": "L-1", "environment": "uat", "relatedRequestIds": [],
+            "evidence": [{
+                "evidenceRef": "evidence-1", "timestamp": "2026-10-23T12:00:00+00:00",
+                "requestId": None, "username": None, "matchedAliases": ["leadId"],
+                "message": "candidate log event",
+            }],
+            "retrieval": {"identifierCorrelation": "candidate"}, "limitations": [],
+        }
+        result = {
+            "narrative": "Unsupported summary.",
+            "latestObservedActivity": None, "currentStage": None,
+            "summaryEvidenceRefs": ["evidence-999"], "stageEvidenceRefs": [],
+            "confidence": "high", "journeyTimeline": [],
+            "findingsAndAnomalies": [], "rootCauseAssessment": None,
+            "suggestedChecks": [], "recommendedNextSteps": [],
+            "limitations": [], "model": config.GROQ_MODEL,
+        }
+        with self.assertLogs("lens.analyzer", level="WARNING") as captured:
+            with self.assertRaises(HTTPException) as raised:
+                lead_service.validate_lead_analysis(result, investigation, {"evidence-1"})
         self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(
+            raised.exception.detail,
+            "Groq returned no usable evidence-grounded Lead Intelligence",
+        )
+        diagnostic = json.loads(captured.records[0].getMessage().split(" diagnostic ", 1)[1])
+        self.assertEqual(diagnostic["nonexistent_reference_count"], 1)
+        self.assertEqual(diagnostic["remaining_validated_findings"], 0)
+        self.assertEqual(diagnostic["validation_reason"], "no_usable_analysis")
 
     def test_new_uat_routes_enforce_existing_investigation_token(self):
         with (

@@ -876,94 +876,126 @@ def validate_lead_analysis(
     valid_refs: set[str],
     context_truncated: bool = False,
 ) -> dict:
-    evidence_by_ref = {
+    canonical_evidence = {
         item["evidenceRef"]: item for item in investigation["evidence"]
-        if item["evidenceRef"] in valid_refs
+        if isinstance(item.get("evidenceRef"), str)
+    }
+    allowed_refs = set(canonical_evidence) & valid_refs
+    evidence_by_ref = {
+        reference: item for reference, item in canonical_evidence.items()
+        if reference in allowed_refs
+    }
+    correlation_ambiguous = (
+        investigation["retrieval"]["identifierCorrelation"] == "ambiguous"
+    )
+    counts = {
+        "malformed_reference_count": 0,
+        "nonexistent_reference_count": 0,
+        "reference_not_in_context_count": 0,
+        "ambiguous_reference_count": 0,
+        "ambiguous_claim_count": 0,
+        "removed_claim_count": 0,
     }
 
-    def validate_claim_refs(claim: dict) -> None:
-        refs = claim.get("evidenceRefs", [])
-        if not refs:
-            _log_lead_analysis_rejection(
-                "evidence_reference_validation",
-                "missing_references",
-                invalid_reference_count=0,
-            )
-            raise HTTPException(status_code=502, detail="Groq returned an unsupported evidence claim")
-        invalid_reference_count = sum(
-            reference not in evidence_by_ref for reference in refs
-        )
-        if invalid_reference_count:
-            _log_lead_analysis_rejection(
-                "evidence_reference_validation",
-                "unknown_reference",
-                invalid_reference_count=invalid_reference_count,
-            )
-            raise HTTPException(status_code=502, detail="Groq cited evidence not present in the retrieved context")
-        if investigation["retrieval"]["identifierCorrelation"] == "ambiguous":
+    def filter_claim(claim: dict) -> dict | None:
+        source_refs = claim.get("evidenceRefs")
+        source_refs = source_refs if isinstance(source_refs, list) else []
+        retained_refs = []
+        seen = set()
+        for reference in source_refs:
+            if not isinstance(reference, str) or reference in seen:
+                continue
+            seen.add(reference)
+            if not re.fullmatch(r"evidence-[1-9]\d*", reference):
+                counts["malformed_reference_count"] += 1
+            elif reference not in canonical_evidence:
+                counts["nonexistent_reference_count"] += 1
+            elif reference not in allowed_refs:
+                counts["reference_not_in_context_count"] += 1
+            else:
+                retained_refs.append(reference)
+
+        if not retained_refs:
+            counts["removed_claim_count"] += 1
+            return None
+        if correlation_ambiguous:
             alias_groups = [
                 set(evidence_by_ref[reference].get("matchedAliases", []))
-                for reference in refs
+                for reference in retained_refs
             ]
-            if any(len(aliases) > 1 for aliases in alias_groups) or len(
-                set.union(*alias_groups) if alias_groups else set()
-            ) > 1:
-                _log_lead_analysis_rejection(
-                    "evidence_reference_validation",
-                    "ambiguous_identifier_correlation",
-                    invalid_reference_count=len(refs),
-                )
-                raise HTTPException(
-                    status_code=502,
-                    detail="Groq combined evidence from ambiguous identifier aliases",
-                )
+            aliases = set.union(*alias_groups) if alias_groups else set()
+            if len(aliases) != 1 or any(len(group) != 1 for group in alias_groups):
+                counts["ambiguous_reference_count"] += len(retained_refs)
+                counts["ambiguous_claim_count"] += 1
+                counts["removed_claim_count"] += 1
+                return None
+
         claim_text = " ".join(
             str(claim.get(key, "")) for key in ("description", "event")
         )
-        supporting_items = [evidence_by_ref[reference] for reference in refs]
+        supporting_items = [evidence_by_ref[reference] for reference in retained_refs]
         if (REQUEST_SUPPORTED_CLAIM.search(claim_text)
                 or re.search(r"\b[45]\d{2}\b", claim_text)) and not any(
-            evidence_by_ref[reference].get("requestId") for reference in refs
+            item.get("requestId") for item in supporting_items
         ):
-            raise HTTPException(
-                status_code=502,
-                detail="Groq made a request-dependent claim without a supporting request ID",
-            )
+            counts["removed_claim_count"] += 1
+            return None
         if CLAIM_SUCCESS.search(claim_text) and not any(
             BUSINESS_SUCCESS_EVIDENCE.search(item["message"]) for item in supporting_items
         ):
-            raise HTTPException(
-                status_code=502,
-                detail="Groq inferred business success without explicit supporting evidence",
-            )
+            counts["removed_claim_count"] += 1
+            return None
         if UNSUPPORTED_ABSENCE_CLAIM.search(claim_text) and not any(
             UNSUPPORTED_ABSENCE_CLAIM.search(item["message"]) for item in supporting_items
         ):
-            raise HTTPException(
-                status_code=502,
-                detail="Groq inferred inactivity without direct supporting evidence",
-            )
+            counts["removed_claim_count"] += 1
+            return None
+        return {**claim, "evidenceRefs": retained_refs}
 
-    for claim in result["journeyTimeline"] + result["findingsAndAnomalies"]:
-        validate_claim_refs(claim)
+    def filter_claims(claims: list[dict]) -> list[dict]:
+        filtered = []
+        for claim in claims:
+            validated = filter_claim(claim)
+            if validated is not None:
+                filtered.append(validated)
+        return filtered
+
+    result = dict(result)
+    result["journeyTimeline"] = filter_claims(result["journeyTimeline"])
+    result["findingsAndAnomalies"] = filter_claims(result["findingsAndAnomalies"])
+    result["recommendedNextSteps"] = filter_claims(result["recommendedNextSteps"])
     root_cause = result["rootCauseAssessment"]
     if root_cause is not None:
-        for claim in root_cause["observedFacts"] + root_cause["possibleCauses"]:
-            validate_claim_refs(claim)
-    for reference in result["summaryEvidenceRefs"] + result["stageEvidenceRefs"]:
-        if reference not in evidence_by_ref:
-            _log_lead_analysis_rejection(
-                "evidence_reference_validation",
-                "unknown_summary_or_stage_reference",
-                invalid_reference_count=1,
-            )
-            raise HTTPException(status_code=502, detail="Groq cited evidence not present in the retrieved context")
-    if result["currentStage"] and not result["stageEvidenceRefs"]:
-        raise HTTPException(status_code=502, detail="Groq returned a stage without supporting evidence")
-    if result["currentStage"] and not any(
-        evidence_by_ref[reference].get("requestId") for reference in result["stageEvidenceRefs"]
-    ):
-        raise HTTPException(status_code=502, detail="Groq returned a stage without a supporting request ID")
+        root_cause = dict(root_cause)
+        root_cause["observedFacts"] = filter_claims(root_cause["observedFacts"])
+        root_cause["possibleCauses"] = filter_claims(root_cause["possibleCauses"])
+        if not root_cause["observedFacts"] and not root_cause["possibleCauses"]:
+            root_cause = None
+        result["rootCauseAssessment"] = root_cause
+
+    summary_claim = filter_claim({
+        "description": " ".join(filter(None, (
+            result["narrative"], result["latestObservedActivity"],
+        ))),
+        "evidenceRefs": result["summaryEvidenceRefs"],
+    }) if result["narrative"] or result["latestObservedActivity"] else None
+    if summary_claim is None:
+        result["narrative"] = ""
+        result["latestObservedActivity"] = None
+        result["summaryEvidenceRefs"] = []
+        result["confidence"] = None
+    else:
+        result["summaryEvidenceRefs"] = summary_claim["evidenceRefs"]
+
+    stage_claim = filter_claim({
+        "description": result["currentStage"] or "",
+        "evidenceRefs": result["stageEvidenceRefs"],
+    }) if result["currentStage"] else None
+    if stage_claim is None:
+        result["currentStage"] = None
+        result["stageEvidenceRefs"] = []
+    else:
+        result["stageEvidenceRefs"] = stage_claim["evidenceRefs"]
     if result["currentStage"]:
         normalized_stage = re.sub(r"[^a-z0-9]+", " ", result["currentStage"].casefold()).strip()
         stage_evidence = " ".join(
@@ -971,25 +1003,15 @@ def validate_lead_analysis(
             for reference in result["stageEvidenceRefs"]
         )
         normalized_evidence = re.sub(r"[^a-z0-9]+", " ", stage_evidence)
-        if not normalized_stage or normalized_stage not in normalized_evidence:
-            raise HTTPException(
-                status_code=502,
-                detail="Groq returned a stage not stated in its supporting evidence",
-            )
-    if result["latestObservedActivity"] and not result["summaryEvidenceRefs"]:
-        raise HTTPException(status_code=502, detail="Groq returned activity without supporting evidence")
-    if result["latestObservedActivity"]:
-        validate_claim_refs({
-            "description": result["latestObservedActivity"],
-            "evidenceRefs": result["summaryEvidenceRefs"],
-        })
-    if result["narrative"] and not result["summaryEvidenceRefs"]:
-        raise HTTPException(status_code=502, detail="Groq returned a summary without supporting evidence")
-    if result["narrative"]:
-        validate_claim_refs({
-            "description": result["narrative"],
-            "evidenceRefs": result["summaryEvidenceRefs"],
-        })
+        has_stage_request = any(
+            evidence_by_ref[reference].get("requestId")
+            for reference in result["stageEvidenceRefs"]
+        )
+        if not normalized_stage or normalized_stage not in normalized_evidence or not has_stage_request:
+            result["currentStage"] = None
+            result["stageEvidenceRefs"] = []
+            result["confidence"] = None
+            counts["removed_claim_count"] += 1
 
     suggested_checks = []
     request_ids = set(investigation["relatedRequestIds"])
@@ -1000,16 +1022,13 @@ def validate_lead_analysis(
     lead_id = investigation["leadId"]
     for proposal in result["suggestedChecks"]:
         action = proposal["action"]
-        refs = proposal["evidenceRefs"]
-        try:
-            validate_claim_refs({
-                "description": proposal["title"] + " " + proposal["reason"],
-                "evidenceRefs": refs,
-            })
-        except HTTPException:
+        validated_proposal = filter_claim({
+            "description": proposal["title"] + " " + proposal["reason"],
+            "evidenceRefs": proposal["evidenceRefs"],
+        })
+        if validated_proposal is None:
             continue
-        if any(reference not in evidence_by_ref for reference in refs):
-            raise HTTPException(status_code=502, detail="Groq proposed a check using unknown evidence")
+        refs = validated_proposal["evidenceRefs"]
         evidenced = [evidence_by_ref[reference] for reference in refs]
         context_type = ACTION_CONTEXT[action]
         navigation = {}
@@ -1026,6 +1045,7 @@ def validate_lead_analysis(
                     "request_id_not_in_evidence",
                     action_type=action if action in ACTION_CONTEXT else "unsupported",
                 )
+                counts["removed_claim_count"] += 1
                 continue
             navigation["requestId"] = candidates[0]
         elif context_type == "user":
@@ -1039,6 +1059,7 @@ def validate_lead_analysis(
                     "username_not_in_evidence",
                     action_type=action if action in ACTION_CONTEXT else "unsupported",
                 )
+                counts["removed_claim_count"] += 1
                 continue
             navigation["username"] = candidates[0]
         suggested_checks.append({
@@ -1048,9 +1069,6 @@ def validate_lead_analysis(
             "priority": proposal["priority"],
             "context": {"environment": investigation["environment"], **navigation},
         })
-    for next_step in result["recommendedNextSteps"]:
-        validate_claim_refs(next_step)
-
     def enrich_claim(claim: dict) -> dict:
         claim = dict(claim)
         claim["supportingEvidence"] = [
@@ -1075,12 +1093,53 @@ def validate_lead_analysis(
     summary_support = [evidence_by_ref[ref] for ref in result["summaryEvidenceRefs"]]
     stage_support = [evidence_by_ref[ref] for ref in result["stageEvidenceRefs"]]
     limitations = list(dict.fromkeys(investigation["limitations"] + result["limitations"]))
+    if sum(counts.values()):
+        limitations.append(
+            "Some AI claims or references were omitted because they were invalid or unsupported."
+        )
     if not result["currentStage"]:
         limitations.append("Current stage could not be established from retrieved evidence.")
     if context_truncated:
         limitations.append("AI input was truncated to the configured context budget.")
     if investigation["retrieval"]["identifierCorrelation"] == "ambiguous":
-        limitations.append("Identifier correlation is ambiguous and all matches are candidates.")
+        limitations.append(
+            "Identifier correlation is ambiguous; matches remain candidates and are not confirmed as the same lead."
+        )
+
+    validated_claim_count = (
+        len(result["journeyTimeline"])
+        + len(result["findingsAndAnomalies"])
+        + (len(root_cause["observedFacts"]) + len(root_cause["possibleCauses"])
+           if root_cause is not None else 0)
+        + len(result["recommendedNextSteps"])
+        + len(suggested_checks)
+    )
+    usable = bool(
+        result["narrative"] or result["latestObservedActivity"]
+        or result["currentStage"] or validated_claim_count
+    )
+    invalid_reference_count = (
+        counts["malformed_reference_count"]
+        + counts["nonexistent_reference_count"]
+        + counts["reference_not_in_context_count"]
+    )
+    _lead_ai_diagnostic(
+        "evidence_reference_validation",
+        invalid_reference_count=invalid_reference_count,
+        **counts,
+        remaining_validated_findings=validated_claim_count,
+        validation_reason=(
+            "no_usable_analysis" if not usable else
+            "ambiguous_identifier_correlation" if counts["ambiguous_claim_count"] else
+            "invalid_evidence_references_removed" if invalid_reference_count else
+            "reference_filtering_completed"
+        ),
+    )
+    if not usable:
+        raise HTTPException(
+            status_code=502,
+            detail="Groq returned no usable evidence-grounded Lead Intelligence",
+        )
     return {
         "leadSummary": {
             "narrative": result["narrative"],

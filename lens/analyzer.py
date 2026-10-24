@@ -78,6 +78,8 @@ _DIAGNOSTIC_REASONS = frozenset({
     "missing_references", "unknown_reference",
     "ambiguous_identifier_correlation", "unknown_summary_or_stage_reference",
     "request_id_not_in_evidence", "username_not_in_evidence", "schema_validation",
+    "reference_filtering_completed", "no_usable_analysis",
+    "invalid_evidence_references_removed",
 })
 
 
@@ -85,7 +87,10 @@ def _lead_ai_diagnostic(stage: str, **details) -> None:
     fields = {"stage": stage if stage in _DIAGNOSTIC_STAGES else "completion_extraction"}
     for key in ("http_status", "prompt_tokens", "completion_tokens", "total_tokens",
                 "line", "column", "position", "invalid_reference_count",
-                "invalid_suggested_check_count"):
+                "invalid_suggested_check_count", "malformed_reference_count",
+                "nonexistent_reference_count", "reference_not_in_context_count",
+                "ambiguous_reference_count", "ambiguous_claim_count", "removed_claim_count",
+                "remaining_validated_findings"):
         value = details.get(key)
         if type(value) is int and 0 <= value <= 1_000_000:
             fields[key] = value
@@ -248,7 +253,7 @@ def _lead_groq_json_schema() -> dict:
     return expand(schema)
 
 
-def _normalize_lead_claims(value, valid_refs: set[str], timeline: bool = False) -> list:
+def _normalize_lead_claims(value, timeline: bool = False) -> list:
     if not isinstance(value, list):
         return []
     normalized = []
@@ -260,9 +265,7 @@ def _normalize_lead_claims(value, valid_refs: set[str], timeline: bool = False) 
             refs = []
         if not isinstance(refs, list):
             continue
-        refs = list(dict.fromkeys(
-            ref for ref in refs if isinstance(ref, str) and ref in valid_refs
-        ))[:5]
+        refs = list(dict.fromkeys(ref for ref in refs if isinstance(ref, str)))[:5]
         description = item.get("description")
         event = item.get("event") if timeline else None
         if not isinstance(description, str) or not description.strip() or not refs:
@@ -273,19 +276,9 @@ def _normalize_lead_claims(value, valid_refs: set[str], timeline: bool = False) 
     return normalized
 
 
-def _normalize_lead_ai_output(parsed, context: str) -> dict:
+def _normalize_lead_ai_output(parsed, _context: str) -> dict:
     if not isinstance(parsed, dict):
         return parsed
-    try:
-        context_data = json.loads(context)
-    except (TypeError, json.JSONDecodeError):
-        context_data = {}
-    context_evidence = context_data.get("evidence", []) if isinstance(context_data, dict) else []
-    evidence_by_ref = {
-        item["evidenceRef"]: item for item in context_evidence
-        if isinstance(item, dict) and isinstance(item.get("evidenceRef"), str)
-    } if isinstance(context_evidence, list) else {}
-    valid_refs = set(evidence_by_ref)
 
     output = dict(parsed)
     if not isinstance(output.get("narrative"), str):
@@ -298,7 +291,7 @@ def _normalize_lead_ai_output(parsed, context: str) -> dict:
         if not isinstance(refs, list):
             refs = []
         output[key] = list(dict.fromkeys(
-            ref for ref in refs if isinstance(ref, str) and ref in valid_refs
+            ref for ref in refs if isinstance(ref, str)
         ))[:5]
     if not output.get("summaryEvidenceRefs"):
         output["narrative"] = ""
@@ -315,13 +308,13 @@ def _normalize_lead_ai_output(parsed, context: str) -> dict:
         if isinstance(limitation, str)
     ]
     output["journeyTimeline"] = _normalize_lead_claims(
-        output.get("journeyTimeline"), valid_refs, timeline=True,
+        output.get("journeyTimeline"), timeline=True,
     )
     output["findingsAndAnomalies"] = _normalize_lead_claims(
-        output.get("findingsAndAnomalies"), valid_refs,
+        output.get("findingsAndAnomalies"),
     )
     output["recommendedNextSteps"] = _normalize_lead_claims(
-        output.get("recommendedNextSteps"), valid_refs,
+        output.get("recommendedNextSteps"),
     )
     root_cause = output.get("rootCauseAssessment")
     if isinstance(root_cause, dict):
@@ -329,7 +322,7 @@ def _normalize_lead_ai_output(parsed, context: str) -> dict:
         for key in ("observedFacts", "possibleCauses"):
             if root_cause.get(key) is None:
                 root_cause[key] = []
-            root_cause[key] = _normalize_lead_claims(root_cause.get(key), valid_refs)
+            root_cause[key] = _normalize_lead_claims(root_cause.get(key))
         output["rootCauseAssessment"] = (
             root_cause
             if root_cause["observedFacts"] or root_cause["possibleCauses"]
@@ -352,18 +345,8 @@ def _normalize_lead_ai_output(parsed, context: str) -> dict:
             continue
         refs = proposal.get("evidenceRefs")
         refs = refs if isinstance(refs, list) else []
-        refs = list(dict.fromkeys(
-            ref for ref in refs if isinstance(ref, str) and ref in valid_refs
-        ))[:3]
+        refs = list(dict.fromkeys(ref for ref in refs if isinstance(ref, str)))[:3]
         if not refs:
-            continue
-        if action in {"REQUEST_INVESTIGATION", "EXTERNAL_API_INSPECTION"} and not any(
-            evidence_by_ref[ref].get("hasRequestId") for ref in refs
-        ):
-            continue
-        if action == "USER_ACTIVITY" and not any(
-            evidence_by_ref[ref].get("hasUsername") for ref in refs
-        ):
             continue
         title = proposal.get("title")
         reason = proposal.get("reason")
@@ -870,6 +853,16 @@ async def call_lead_groq(context: str) -> dict:
         "reasoning_effort": "low",
         "max_completion_tokens": 1800,
     }
+    logger.debug(
+        "Lead Intelligence Groq request metadata %s",
+        json.dumps({
+            "model": payload["model"],
+            "response_format_type": payload["response_format"]["type"],
+            "reasoning_effort": payload["reasoning_effort"],
+            "max_completion_tokens": payload["max_completion_tokens"],
+            "message_roles": [message["role"] for message in payload["messages"]],
+        }, ensure_ascii=True, separators=(",", ":")),
+    )
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
@@ -914,6 +907,17 @@ async def call_lead_groq(context: str) -> dict:
         data if isinstance(data, dict) else {},
         response.status_code,
     )
+    logger.debug(
+        "Lead Intelligence Groq response metadata %s",
+        json.dumps({
+            **metadata,
+            "choice_count": min(
+                len(data.get("choices", [])) if isinstance(data, dict)
+                and isinstance(data.get("choices"), list) else 0,
+                100,
+            ),
+        }, ensure_ascii=True, separators=(",", ":")),
+    )
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
@@ -942,6 +946,10 @@ async def call_lead_groq(context: str) -> dict:
             position=exc.pos,
         )
         raise HTTPException(status_code=502, detail="Groq returned invalid Lead Intelligence") from exc
+    logger.debug(
+        "Lead Intelligence Groq parsed response shape %s",
+        json.dumps(_lead_response_shape(parsed), ensure_ascii=True, separators=(",", ":")),
+    )
     json_double_encoded = False
     if isinstance(parsed, str):
         try:
