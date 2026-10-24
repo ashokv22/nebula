@@ -44,6 +44,21 @@ _GROQ_ERROR_CATEGORIES = frozenset({
     "rate_limit_exceeded", "server_error", "insufficient_quota",
     "context_length_exceeded", "model_not_found",
 })
+_GROQ_ERROR_CODES = frozenset({
+    "invalid_api_key", "model_decommissioned", "rate_limit_exceeded",
+    "context_length_exceeded", "json_validate_failed", "failed_to_parse",
+    "insufficient_quota", "model_not_found",
+})
+_GROQ_ERROR_PARAMS = frozenset({
+    "model", "messages", "response_format", "max_completion_tokens",
+    "temperature", "top_p", "reasoning_effort", "response_format.json_schema",
+    "response_format.json_schema.schema",
+})
+_GROQ_ERROR_MESSAGE_CATEGORIES = frozenset({
+    "schema_unsupported_keyword", "schema_not_supported", "invalid_schema",
+    "response_format_unsupported", "completion_token_limit", "reasoning_effort",
+    "invalid_model", "invalid_parameter", "invalid_request",
+})
 _DIAGNOSTIC_STAGES = frozenset({
     "completion_extraction", "json_parsing", "pydantic_validation",
     "evidence_reference_validation", "suggested_check_validation",
@@ -81,12 +96,20 @@ def _lead_ai_diagnostic(stage: str, **details) -> None:
             key for key in root_keys[:len(_LEAD_ROOT_FIELDS)]
             if isinstance(key, str) and key in _LEAD_ROOT_FIELDS
         ]
-    for key in ("provider_error_category", "finish_reason", "error_type",
+    for key in ("provider_error_category", "provider_error_type",
+                "provider_error_param", "provider_error_code",
+                "provider_message_category", "finish_reason", "error_type",
                 "validation_reason"):
         value = details.get(key)
         allowed = (
             _GROQ_ERROR_CATEGORIES | {"none", "other", "unclassified"}
-            if key == "provider_error_category" else
+            if key in {"provider_error_category", "provider_error_type"} else
+            _GROQ_ERROR_PARAMS | {"other"}
+            if key == "provider_error_param" else
+            _GROQ_ERROR_CODES | {"other"}
+            if key == "provider_error_code" else
+            _GROQ_ERROR_MESSAGE_CATEGORIES
+            if key == "provider_message_category" else
             {"stop", "length", "tool_calls", "content_filter", "function_call", "other"}
             if key == "finish_reason" else
             {"JSONDecodeError", "ValidationError", "KeyError", "IndexError", "TypeError"}
@@ -109,14 +132,67 @@ def _lead_ai_diagnostic(stage: str, **details) -> None:
     )
 
 
-def _provider_error_category(response: httpx.Response) -> str:
+def _provider_error_details(response: httpx.Response) -> dict:
     try:
         body = response.json()
         error = body.get("error", {}) if isinstance(body, dict) else {}
-        category = error.get("type") or error.get("code") if isinstance(error, dict) else None
     except (ValueError, TypeError):
-        return "unclassified"
-    return category if isinstance(category, str) and category in _GROQ_ERROR_CATEGORIES else "other"
+        error = {}
+    if not isinstance(error, dict):
+        error = {}
+    error_type = error.get("type")
+    error_param = error.get("param")
+    error_code = error.get("code")
+    error_message = error.get("message")
+    sanitized_param = (
+        error_param if isinstance(error_param, str) and error_param in _GROQ_ERROR_PARAMS
+        else "other"
+    )
+    return {
+        "provider_error_category": (
+            error_type if isinstance(error_type, str) and error_type in _GROQ_ERROR_CATEGORIES
+            else error_code if isinstance(error_code, str) and error_code in _GROQ_ERROR_CATEGORIES
+            else "other"
+        ),
+        "provider_error_type": (
+            error_type if isinstance(error_type, str) and error_type in _GROQ_ERROR_CATEGORIES
+            else "other"
+        ),
+        "provider_error_param": (
+            sanitized_param
+        ),
+        "provider_error_code": (
+            error_code if isinstance(error_code, str) and error_code in _GROQ_ERROR_CODES
+            else "other"
+        ),
+        "provider_message_category": _provider_message_category(error_message),
+    }
+
+
+def _provider_message_category(message) -> str:
+    if not isinstance(message, str):
+        return "invalid_request"
+    normalized = message.casefold()
+    if "additionalproperties" in normalized or "additional properties" in normalized:
+        return "schema_unsupported_keyword"
+    if "unsupported keyword" in normalized or "unknown keyword" in normalized:
+        return "schema_unsupported_keyword"
+    if "schema" in normalized and any(term in normalized for term in ("unsupported", "not support")):
+        return "schema_not_supported"
+    if "schema" in normalized and any(term in normalized for term in ("invalid", "required", "must")):
+        return "invalid_schema"
+    if "response_format" in normalized or "response format" in normalized or "json_schema" in normalized:
+        if any(term in normalized for term in ("unsupported", "not support", "invalid")):
+            return "response_format_unsupported"
+    if any(term in normalized for term in ("max_completion_tokens", "token limit", "too many tokens")):
+        return "completion_token_limit"
+    if "reasoning_effort" in normalized or "reasoning effort" in normalized:
+        return "reasoning_effort"
+    if "model" in normalized and any(term in normalized for term in ("invalid", "not found", "unsupported")):
+        return "invalid_model"
+    if "parameter" in normalized or "param" in normalized:
+        return "invalid_parameter"
+    return "invalid_request"
 
 
 def _completion_metadata(data: dict, http_status: int) -> dict:
@@ -552,12 +628,10 @@ async def call_groq(context: str, valid_indices: set[int], free_text: bool) -> d
     #     detail = f"Groq analysis failed with HTTP {status_code}" if status_code else "Groq analysis request failed"
     #     raise HTTPException(status_code=502, detail=detail) from exc
     except httpx.HTTPStatusError as exc:
-        logger.warning(
-            "Groq request failed",
-            extra={
-                "groq_http_status": exc.response.status_code,
-                "groq_error_category": _provider_error_category(exc.response),
-            },
+        _lead_ai_diagnostic(
+            "completion_extraction",
+            http_status=exc.response.status_code,
+            **_provider_error_details(exc.response),
         )
         raise HTTPException(
             status_code=502,
@@ -676,7 +750,7 @@ async def call_lead_groq(context: str) -> dict:
         _lead_ai_diagnostic(
             "completion_extraction",
             http_status=exc.response.status_code,
-            provider_error_category=_provider_error_category(exc.response),
+            **_provider_error_details(exc.response),
         )
         raise HTTPException(
             status_code=502,

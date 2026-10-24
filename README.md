@@ -44,6 +44,62 @@ available in the detailed `timeline` field.
 Loki range-query limits apply to the existing request, user, and error endpoints;
 large result sets there can be truncated.
 
+## Persistent application logging (Linux)
+
+The FastAPI app configures a DEBUG-level `WatchedFileHandler` at
+`/var/log/nebula/nebula.log` and an INFO-level console handler. Uvicorn loggers
+propagate to those handlers to avoid duplicate records. HTTPX wire logging is
+kept at WARNING. Exception traces include exception type and frame locations,
+not exception messages or source lines. Loki logs record duration and result
+count without logging the query; Groq provider diagnostics log only allowlisted
+error type, parameter, and code values.
+
+No Nebula FastAPI systemd unit was found during setup inspection; the existing
+`dcb-ft16-server.service` is a Java service running as `ubuntu`. Set the file
+ownership below to the actual FastAPI service user and group. Example for an
+`ubuntu` service:
+
+```bash
+sudo install -d -o ubuntu -g ubuntu -m 0750 /var/log/nebula
+sudo install -d -o root -g root -m 0755 /etc/nebula
+sudo install -o root -g root -m 0644 deploy/logrotate/nebula.logrotate \
+  /etc/nebula/nebula.logrotate
+sudo install -o root -g root -m 0644 deploy/systemd/nebula-logrotate.service \
+  /etc/systemd/system/nebula-logrotate.service
+sudo install -o root -g root -m 0644 deploy/systemd/nebula-logrotate.timer \
+  /etc/systemd/system/nebula-logrotate.timer
+sudo systemctl daemon-reload
+sudo logrotate --debug --state /var/lib/logrotate/nebula.status \
+  /etc/nebula/nebula.logrotate
+sudo systemctl enable --now nebula-logrotate.timer
+SERVICE=nebula-fastapi.service  # replace with the installed FastAPI unit name
+sudo systemctl show "$SERVICE" -p User -p Group
+sudo systemctl restart "$SERVICE"
+```
+
+Before installation, update `create 0640 ubuntu ubuntu` and `su ubuntu ubuntu`
+in `deploy/logrotate/nebula.logrotate` if the FastAPI service has a different
+user/group. The app user needs write access to the directory; rotated files are
+created mode `0640` for that user/group. This dedicated hourly timer invokes a
+separate logrotate config and state file, so it does not alter or race the
+system's existing logrotate service/timer configuration. It checks hourly,
+rotates at 5 MB, compresses archives, and retains up to 720 hourly rotations
+with a 30-day maximum age.
+
+Verify after deployment:
+
+```bash
+sudo systemctl status "$SERVICE" nebula-logrotate.timer --no-pager
+sudo journalctl -u "$SERVICE" -n 100 --no-pager
+sudo tail -n 100 /var/log/nebula/nebula.log
+sudo logrotate --force --state /var/lib/logrotate/nebula.status \
+  /etc/nebula/nebula.logrotate
+sudo ls -l /var/log/nebula
+```
+
+Run the logging smoke test from the repository root with
+`python3 -m unittest tests.test_logging`.
+
 Set `API_TOKEN` to enable Groq analysis. The service sends only a compact,
 redacted diagnostic context to `openai/gpt-oss-20b`; it does not alter the
 existing request timeline or raw-log responses. Context defaults are capped at

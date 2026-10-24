@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import math
 import re
 import time
@@ -18,6 +19,8 @@ from lens.analyzer import _lead_ai_diagnostic
 from lens.loki import loki_query
 from lens.parser import extract_request_id, request_entry_matches
 from lens.schemas import LeadIntelligenceModel
+
+logger = logging.getLogger(__name__)
 
 LEAD_ALIASES = ("leadId", "applicantId", "applicationId", "partnerLoanId")
 LEAD_FIELD = re.compile(
@@ -777,6 +780,19 @@ async def investigate_lead(
         "preprocessing": round((finished - correlation_finished) * 1000, 2),
         "total": round((finished - total_started) * 1000, 2),
     }
+    logger.debug(
+        "Lead investigation retrieval completed env=%s candidate_lines=%d "
+        "selected_request_ids=%d evidence=%d total_ms=%.2f discovery_ms=%.2f "
+        "correlation_ms=%.2f preprocessing_ms=%.2f",
+        environment,
+        candidate_stats["returnedLines"],
+        len(request_ids),
+        len(evidence),
+        result["timingsMs"]["total"],
+        result["timingsMs"]["lokiDiscovery"],
+        result["timingsMs"]["requestCorrelation"],
+        result["timingsMs"]["preprocessing"],
+    )
     return result
 
 

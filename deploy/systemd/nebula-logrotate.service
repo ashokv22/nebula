@@ -1,0 +1,6 @@
+[Unit]
+Description=Rotate Nebula application log
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate --state /var/lib/logrotate/nebula.status /etc/nebula/nebula.logrotate

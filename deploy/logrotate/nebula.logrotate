@@ -1,0 +1,10 @@
+/var/log/nebula/nebula.log {
+    size 5M
+    rotate 720
+    maxage 30
+    compress
+    missingok
+    notifempty
+    create 0640 ubuntu ubuntu
+    su ubuntu ubuntu
+}

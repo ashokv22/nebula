@@ -148,6 +148,10 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertTrue(response_format["json_schema"]["strict"])
         self.assertEqual(response_format["json_schema"]["schema"], analyzer._lead_groq_json_schema())
         self.assertEqual(response_format["json_schema"]["schema"]["type"], "object")
+        self.assertEqual(sent["model"], config.GROQ_MODEL)
+        self.assertEqual(sent["reasoning_effort"], "low")
+        self.assertEqual(sent["max_completion_tokens"], 1800)
+        self.assertNotIn("temperature", sent)
         self.assertEqual(result["journeyTimeline"][0]["description"], "A candidate event was observed.")
 
     def test_lead_provider_schema_enforces_object_roots_and_complete_nested_shapes(self):
@@ -212,6 +216,55 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertEqual(diagnostic["root_keys"], ["narrative"])
         self.assertNotIn(private_key, captured.records[0].getMessage())
         self.assertNotIn("PRIVATE_VALUE", captured.records[0].getMessage())
+
+    def test_groq_provider_error_diagnostics_are_sanitized_and_visible(self):
+        response = SimpleNamespace(
+            json=lambda: {"error": {
+                "type": "invalid_request_error",
+                "param": "response_format.json_schema.schema",
+                "code": "json_validate_failed",
+                "message": "Unsupported schema keyword additionalProperties near PRIVATE_VALUE",
+            }},
+        )
+        details = analyzer._provider_error_details(response)
+        self.assertEqual(details, {
+            "provider_error_category": "invalid_request_error",
+            "provider_error_type": "invalid_request_error",
+            "provider_error_param": "response_format.json_schema.schema",
+            "provider_error_code": "json_validate_failed",
+            "provider_message_category": "schema_unsupported_keyword",
+        })
+        with self.assertLogs("lens.analyzer", level="WARNING") as captured:
+            analyzer._lead_ai_diagnostic(
+                "completion_extraction",
+                http_status=400,
+                **details,
+            )
+        message = captured.records[0].getMessage()
+        self.assertIn('"http_status":400', message)
+        self.assertIn('"provider_error_type":"invalid_request_error"', message)
+        self.assertIn('"provider_error_param":"response_format.json_schema.schema"', message)
+        self.assertIn('"provider_error_code":"json_validate_failed"', message)
+        self.assertIn('"provider_message_category":"schema_unsupported_keyword"', message)
+        self.assertNotIn("PRIVATE_VALUE", message)
+        self.assertNotIn("Unsupported schema keyword", message)
+
+    def test_provider_error_message_categories_do_not_emit_message_content(self):
+        cases = {
+            "schema property additionalProperties is unsupported": "schema_unsupported_keyword",
+            "invalid schema": "invalid_schema",
+            "response_format is not supported": "response_format_unsupported",
+            "max_completion_tokens exceeds limit": "completion_token_limit",
+            "reasoning_effort is invalid": "reasoning_effort",
+            "model not found": "invalid_model",
+            "unknown parameter: customerName": "invalid_parameter",
+        }
+        for message, expected_category in cases.items():
+            with self.subTest(expected_category=expected_category):
+                self.assertEqual(
+                    analyzer._provider_message_category(message),
+                    expected_category,
+                )
 
     def test_groq_diagnostics_identify_model_validation_fields_without_input_values(self):
         unsafe_value = "SYNTHETIC_PRIVATE_CUSTOMER_VALUE"

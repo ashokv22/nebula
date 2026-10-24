@@ -1,10 +1,15 @@
+import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import HTTPException
 
 from core.config import LOKI_URL
+from core.logging_config import log_sanitized_exception
 from lens.parser import parse_entry
+
+logger = logging.getLogger(__name__)
 
 
 async def loki_query(query: str, minutes: int, limit: int, direction: str = "BACKWARD",
@@ -15,16 +20,23 @@ async def loki_query(query: str, minutes: int, limit: int, direction: str = "BAC
     params = {"query": query, "start": str(int(start.timestamp() * 1_000_000_000)),
               "end": str(int(end.timestamp() * 1_000_000_000)), "limit": limit,
               "direction": direction}
+    started = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.get(f"{LOKI_URL}/loki/api/v1/query_range", params=params)
             response.raise_for_status()
             data = response.json()
     except (httpx.HTTPError, ValueError) as exc:
+        log_sanitized_exception(logger, "Loki range query failed", exc)
         raise HTTPException(status_code=502, detail=f"Loki query failed: {type(exc).__name__}") from exc
     if data.get("status") != "success":
         raise HTTPException(status_code=502, detail="Loki returned unsuccessful status")
     entries = [parse_entry(ns, line) for stream in data.get("data", {}).get("result", [])
                for ns, line in stream.get("values", [])]
     entries.sort(key=lambda x: x["timestamp"])
+    logger.debug(
+        "Loki range query completed duration_ms=%.2f returned_lines=%d",
+        (time.perf_counter() - started) * 1000,
+        len(entries),
+    )
     return entries

@@ -1,0 +1,9 @@
+[Unit]
+Description=Check Nebula application log size hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
