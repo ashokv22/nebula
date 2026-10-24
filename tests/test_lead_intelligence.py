@@ -533,6 +533,87 @@ class LeadIntelligenceTests(unittest.TestCase):
                 [alias],
             )
 
+    def test_lead_discovery_uses_literal_filter_and_exact_python_validation(self):
+        lines = [
+            self.entry(1, '{"leadId":"3291","amount":3291}', request_id=""),
+            self.entry(2, '{"leadId":"13291"}', request_id=""),
+            self.entry(3, '{"leadId":"32910"}', request_id=""),
+            self.entry(4, '{"amount":3291,"message":"unrelated"}', request_id=""),
+            self.entry(5, '{"applicantId":"3291"}', request_id=""),
+        ]
+        async def fake_loki(query, *args, **kwargs):
+            self.assertIn('{env="prod",app="prod"} |= "3291"', query)
+            self.assertNotIn("|~", query)
+            return lines
+
+        with patch("lens.lead_service.loki_query", new=AsyncMock(side_effect=fake_loki)):
+            result = asyncio.run(lead_service.investigate_lead("3291", "prod", 1))
+
+        self.assertEqual(result["candidateCount"], 2)
+        self.assertEqual(
+            [item["matchedAliases"] for item in result["evidence"]],
+            [["leadId"], ["applicantId"]],
+        )
+        self.assertEqual(result["retrieval"]["identifierCorrelation"], "ambiguous")
+        self.assertEqual(result["retrieval"]["candidate"]["matchedLines"], 2)
+
+    def test_literal_discovery_subdivides_noise_to_retain_older_exact_matches(self):
+        start = datetime.now(timezone.utc) - timedelta(hours=1)
+        end = datetime.now(timezone.utc)
+        false_positive = self.entry(1, '{"leadId":"13291"}', request_id="")
+        older_match = self.entry(2, '{"leadId":"3291"}', request_id="")
+        newer_match = self.entry(3, '{"applicationId":"3291"}', request_id="")
+        calls = 0
+
+        async def fake_loki(query, minutes, limit, window_start=None, window_end=None):
+            nonlocal calls
+            calls += 1
+            if calls in {1, 2}:
+                return [false_positive, false_positive]
+            if calls == 3:
+                return [false_positive]
+            if calls == 4:
+                return [older_match]
+            if calls == 5:
+                return [newer_match]
+            self.fail(f"Unexpected discovery query #{calls}")
+
+        with (
+            patch.object(config, "LEAD_LOKI_PAGE_SIZE", 2),
+            patch.object(config, "LEAD_MAX_LOKI_QUERIES", 10),
+            patch("lens.lead_service.loki_query", new=AsyncMock(side_effect=fake_loki)),
+        ):
+            entries, stats = asyncio.run(lead_service._bounded_loki_discovery(
+                '{env="prod",app="prod"} |= "3291"',
+                start,
+                end,
+                10,
+                lambda entry: entry if lead_service.matched_lead_aliases(entry, "3291") else None,
+            ))
+
+        self.assertEqual(entries, [older_match, newer_match])
+        self.assertEqual(stats["queryCount"], 5)
+        self.assertEqual(stats["queriedLines"], 7)
+        self.assertEqual(stats["returnedLines"], 3)
+        self.assertEqual(stats["matchedLines"], 2)
+        self.assertFalse(stats["incompleteSearch"])
+
+    def test_literal_discovery_reports_incomplete_search_when_query_budget_is_exhausted(self):
+        matching = self.entry(1, '{"leadId":"3291"}', request_id="")
+        with (
+            patch.object(config, "LEAD_LOKI_PAGE_SIZE", 1),
+            patch.object(config, "LEAD_MAX_LOKI_QUERIES", 1),
+            patch("lens.lead_service.loki_query", new=AsyncMock(return_value=[matching])),
+        ):
+            result = asyncio.run(lead_service.investigate_lead("3291", "prod", 1))
+
+        self.assertTrue(result["retrieval"]["candidate"]["truncated"])
+        self.assertTrue(result["retrieval"]["candidate"]["incompleteSearch"])
+        self.assertIn(
+            "Candidate Loki retrieval was truncated",
+            " ".join(result["limitations"]),
+        )
+
     def test_request_id_extraction_uses_existing_logback_mdc_shape(self):
         raw = (
             "2026-10-23 12:00:01.000 [worker-1] NOTICE "

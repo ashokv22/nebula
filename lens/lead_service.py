@@ -399,16 +399,6 @@ def compact_large_api_entry(entry: dict) -> dict:
     return compacted
 
 
-def _query_pattern(lead_id: str) -> str:
-    return (
-        r"""(?i)(^|[,{|;[:space:]])["']?"""
-        r"""(leadId|applicantId|applicationId|partnerLoanId)["']?[[:space:]]*[:=]"""
-        r"""[[:space:]]*["']?"""
-        + re.escape(lead_id)
-        + r"""([^A-Za-z0-9_-]|$)"""
-    )
-
-
 def request_timeline_query(selector: str, request_ids: list[str]) -> str:
     request_pattern = r"\[(" + "|".join(re.escape(item) for item in request_ids) + r"),"
     return (
@@ -502,6 +492,69 @@ async def _bounded_loki_query(
     }
 
 
+async def _bounded_loki_discovery(
+    query: str,
+    start: datetime,
+    end: datetime,
+    total_limit: int,
+    entry_processor,
+) -> tuple[list[dict], dict]:
+    page_size = max(1, min(config.LEAD_LOKI_PAGE_SIZE, total_limit, 5000))
+    query_limit = max(0, config.LEAD_MAX_LOKI_QUERIES)
+    found: list[dict] = []
+    inspected_lines = 0
+    queried_lines = 0
+    query_count = 0
+    truncated = False
+    pending = [(start, end)]
+
+    while pending:
+        if query_count >= query_limit or inspected_lines >= total_limit:
+            truncated = True
+            break
+        range_start, range_end = pending.pop(0)
+        query_count += 1
+        duration_minutes = max(1, math.ceil((range_end - range_start).total_seconds() / 60))
+        entries = await loki_query(
+            query,
+            duration_minutes,
+            min(page_size, total_limit - inspected_lines),
+            window_start=range_start,
+            window_end=range_end,
+        )
+        queried_lines += len(entries)
+        requested_limit = min(page_size, total_limit - inspected_lines)
+        saturated = len(entries) >= requested_limit
+        span = (range_end - range_start).total_seconds()
+        if saturated and span > 1 and query_count < query_limit:
+            midpoint = range_start + (range_end - range_start) / 2
+            if range_start < midpoint < range_end:
+                pending[0:0] = [(range_start, midpoint), (midpoint, range_end)]
+                continue
+        available = total_limit - inspected_lines
+        inspected = entries[:available]
+        inspected_lines += len(inspected)
+        for entry in inspected:
+            processed = entry_processor(entry)
+            if processed is not None:
+                found.append(processed)
+        if saturated:
+            truncated = True
+
+    if pending:
+        truncated = True
+    return found, {
+        "queryCount": query_count,
+        "queriedLines": queried_lines,
+        "returnedLines": inspected_lines,
+        "matchedLines": len(found),
+        "truncated": truncated,
+        "incompleteSearch": truncated,
+        "lineLimit": total_limit,
+        "pageSize": page_size,
+    }
+
+
 async def investigate_lead(
     lead_id: str,
     environment: Literal["uat", "prod"],
@@ -521,7 +574,7 @@ async def investigate_lead(
         )
 
     selector = selector_for_environment(environment)
-    candidate_query = selector + " |~ " + json.dumps(_query_pattern(lead_id))
+    candidate_query = selector + " |= " + json.dumps(lead_id)
 
     def prepare_candidate(entry: dict) -> dict | None:
         compacted = compact_large_api_entry(entry)
@@ -535,12 +588,12 @@ async def investigate_lead(
         compacted["_matchedLeadAliases"] = aliases
         return compacted
 
-    candidate_lines, candidate_stats = await _bounded_loki_query(
+    candidate_lines, candidate_stats = await _bounded_loki_discovery(
         candidate_query,
         window_start,
         window_end,
         max(1, config.LEAD_MAX_RETRIEVED_LINES),
-        entry_processor=prepare_candidate,
+        prepare_candidate,
     )
     discovery_finished = time.perf_counter()
     candidate_by_key = {}
