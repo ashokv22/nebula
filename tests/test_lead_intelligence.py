@@ -141,7 +141,40 @@ class LeadIntelligenceTests(unittest.TestCase):
             separators=(",", ":"),
         )
         self.assertIn(schema, system_prompt)
+        self.assertIn("do not output the schema", system_prompt)
+        self.assertIn("single response object", system_prompt)
         self.assertEqual(result["journeyTimeline"][0]["description"], "A candidate event was observed.")
+
+    def test_lead_groq_reports_array_double_encoded_and_invalid_roots(self):
+        cases = (
+            (json.dumps([]), "list", False),
+            (json.dumps(json.dumps(self.valid_lead_model_output())), "str", True),
+            (json.dumps(42), "int", False),
+        )
+        for content, expected_type, double_encoded in cases:
+            with self.subTest(expected_type=expected_type, double_encoded=double_encoded):
+                with self.assertLogs("lens.analyzer", level="WARNING") as captured:
+                    with self.assertRaises(HTTPException):
+                        self.call_lead_groq_with_content(content)
+                diagnostic = captured.records[0].lead_ai_diagnostic
+                self.assertEqual(diagnostic["stage"], "pydantic_validation")
+                self.assertEqual(diagnostic["parsed_root_type"], expected_type)
+                self.assertEqual(diagnostic["validation_input_type"], expected_type)
+                self.assertEqual(diagnostic["json_double_encoded"], double_encoded)
+
+    def test_lead_groq_root_keys_are_limited_to_known_schema_names(self):
+        private_key = "CUSTOM_PRIVATE_KEY"
+        with self.assertLogs("lens.analyzer", level="WARNING") as captured:
+            with self.assertRaises(HTTPException):
+                self.call_lead_groq_with_content(json.dumps({
+                    "narrative": "Candidate summary",
+                    private_key: "PRIVATE_VALUE",
+                }))
+        diagnostic = captured.records[0].lead_ai_diagnostic
+        self.assertEqual(diagnostic["parsed_root_type"], "dict")
+        self.assertEqual(diagnostic["root_keys"], ["narrative"])
+        self.assertNotIn(private_key, captured.records[0].getMessage())
+        self.assertNotIn("PRIVATE_VALUE", captured.records[0].getMessage())
 
     def test_groq_diagnostics_identify_model_validation_fields_without_input_values(self):
         unsafe_value = "SYNTHETIC_PRIVATE_CUSTOMER_VALUE"

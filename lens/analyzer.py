@@ -32,6 +32,13 @@ _LEAD_FIELDS = frozenset({
     "possibleCauses", "suggestedChecks", "action", "title", "reason", "priority",
     "recommendedNextSteps", "limitations", "model",
 })
+_LEAD_ROOT_FIELDS = frozenset({
+    "narrative", "latestObservedActivity", "currentStage", "summaryEvidenceRefs",
+    "stageEvidenceRefs", "confidence", "journeyTimeline", "findingsAndAnomalies",
+    "rootCauseAssessment", "suggestedChecks", "recommendedNextSteps", "limitations",
+    "model",
+})
+_ROOT_TYPE_NAMES = frozenset({"dict", "list", "str", "int", "float", "bool", "null"})
 _GROQ_ERROR_CATEGORIES = frozenset({
     "invalid_request_error", "authentication_error", "permission_error",
     "rate_limit_exceeded", "server_error", "insufficient_quota",
@@ -56,6 +63,18 @@ def _lead_ai_diagnostic(stage: str, **details) -> None:
         value = details.get(key)
         if type(value) is int and 0 <= value <= 1_000_000:
             fields[key] = value
+    for key in ("parsed_root_type", "validation_input_type"):
+        value = details.get(key)
+        if isinstance(value, str) and value in _ROOT_TYPE_NAMES:
+            fields[key] = value
+    if type(details.get("json_double_encoded")) is bool:
+        fields["json_double_encoded"] = details["json_double_encoded"]
+    root_keys = details.get("root_keys")
+    if isinstance(root_keys, list):
+        fields["root_keys"] = [
+            key for key in root_keys[:len(_LEAD_ROOT_FIELDS)]
+            if isinstance(key, str) and key in _LEAD_ROOT_FIELDS
+        ]
     for key in ("provider_error_category", "finish_reason", "error_type",
                 "validation_reason"):
         value = details.get(key)
@@ -523,7 +542,9 @@ async def call_lead_groq(context: str) -> dict:
                     "request ID; USER_ACTIVITY requires evidence with a username; LEAD_HISTORY "
                     "and COMPARE_ATTEMPTS use the lead context. Do not add fields, infer IDs, or "
                     "fabricate supporting evidence. The server constructs navigation context from "
-                    "validated evidence. Schema: "
+                    "validated evidence. Use the schema below as instructions only; do not output "
+                    "the schema, a wrapper containing the schema, or any text outside the single "
+                    "response object. Schema: "
                     + lead_output_schema
                 ),
             },
@@ -608,6 +629,27 @@ async def call_lead_groq(context: str) -> dict:
             position=exc.pos,
         )
         raise HTTPException(status_code=502, detail="Groq returned invalid Lead Intelligence") from exc
+    json_double_encoded = False
+    if isinstance(parsed, str):
+        try:
+            json.loads(parsed)
+            json_double_encoded = True
+        except json.JSONDecodeError:
+            pass
+    parsed_root_type = (
+        "null" if parsed is None else
+        "bool" if isinstance(parsed, bool) else
+        "dict" if isinstance(parsed, dict) else
+        "list" if isinstance(parsed, list) else
+        "str" if isinstance(parsed, str) else
+        "int" if isinstance(parsed, int) else
+        "float" if isinstance(parsed, float) else
+        "other"
+    )
+    root_keys = (
+        sorted(key for key in parsed if isinstance(key, str) and key in _LEAD_ROOT_FIELDS)
+        if isinstance(parsed, dict) else []
+    )
     try:
         return LeadIntelligenceModel.model_validate(parsed).model_dump()
     except ValidationError as exc:
@@ -619,5 +661,9 @@ async def call_lead_groq(context: str) -> dict:
             error_types=error_types,
             invalid_suggested_check_count=suggested_errors,
             validation_reason="schema_validation" if suggested_errors else None,
+            parsed_root_type=parsed_root_type,
+            validation_input_type=parsed_root_type,
+            root_keys=root_keys,
+            json_double_encoded=json_double_encoded,
         )
         raise HTTPException(status_code=502, detail="Groq returned invalid Lead Intelligence") from exc
