@@ -947,8 +947,9 @@ def validate_lead_analysis(
     for claim in result["journeyTimeline"] + result["findingsAndAnomalies"]:
         validate_claim_refs(claim)
     root_cause = result["rootCauseAssessment"]
-    for claim in root_cause["observedFacts"] + root_cause["possibleCauses"]:
-        validate_claim_refs(claim)
+    if root_cause is not None:
+        for claim in root_cause["observedFacts"] + root_cause["possibleCauses"]:
+            validate_claim_refs(claim)
     for reference in result["summaryEvidenceRefs"] + result["stageEvidenceRefs"]:
         if reference not in evidence_by_ref:
             _log_lead_analysis_rejection(
@@ -1000,10 +1001,13 @@ def validate_lead_analysis(
     for proposal in result["suggestedChecks"]:
         action = proposal["action"]
         refs = proposal["evidenceRefs"]
-        validate_claim_refs({
-            "description": proposal["title"] + " " + proposal["reason"],
-            "evidenceRefs": refs,
-        })
+        try:
+            validate_claim_refs({
+                "description": proposal["title"] + " " + proposal["reason"],
+                "evidenceRefs": refs,
+            })
+        except HTTPException:
+            continue
         if any(reference not in evidence_by_ref for reference in refs):
             raise HTTPException(status_code=502, detail="Groq proposed a check using unknown evidence")
         evidenced = [evidence_by_ref[reference] for reference in refs]
@@ -1022,7 +1026,7 @@ def validate_lead_analysis(
                     "request_id_not_in_evidence",
                     action_type=action if action in ACTION_CONTEXT else "unsupported",
                 )
-                raise HTTPException(status_code=502, detail="Groq proposed a request check without a supported request ID")
+                continue
             navigation["requestId"] = candidates[0]
         elif context_type == "user":
             candidates = list(dict.fromkeys(
@@ -1035,7 +1039,7 @@ def validate_lead_analysis(
                     "username_not_in_evidence",
                     action_type=action if action in ACTION_CONTEXT else "unsupported",
                 )
-                raise HTTPException(status_code=502, detail="Groq proposed a user check without a supported username")
+                continue
             navigation["username"] = candidates[0]
         suggested_checks.append({
             "action": action,
@@ -1061,11 +1065,13 @@ def validate_lead_analysis(
 
     timeline = [enrich_claim(claim) for claim in result["journeyTimeline"]]
     findings = [enrich_claim(item) for item in result["findingsAndAnomalies"]]
-    facts = [enrich_claim(item) for item in root_cause["observedFacts"]]
-    causes = [enrich_claim(item) for item in root_cause["possibleCauses"]]
+    facts = [
+        enrich_claim(item) for item in root_cause["observedFacts"]
+    ] if root_cause is not None else []
+    causes = [
+        enrich_claim(item) for item in root_cause["possibleCauses"]
+    ] if root_cause is not None else []
     next_steps = [enrich_claim(item) for item in result["recommendedNextSteps"]]
-    root_cause["observedFacts"] = facts
-    root_cause["possibleCauses"] = causes
     summary_support = [evidence_by_ref[ref] for ref in result["summaryEvidenceRefs"]]
     stage_support = [evidence_by_ref[ref] for ref in result["stageEvidenceRefs"]]
     limitations = list(dict.fromkeys(investigation["limitations"] + result["limitations"]))
@@ -1097,8 +1103,8 @@ def validate_lead_analysis(
         "rootCauseAssessment": {
             "observedFacts": facts,
             "possibleCauses": causes,
-            "confidence": root_cause["confidence"],
-        },
+            "confidence": root_cause["confidence"] if root_cause is not None else None,
+        } if root_cause is not None else None,
         "suggestedChecks": suggested_checks,
         "recommendedNextSteps": next_steps,
         "limitations": list(dict.fromkeys(limitations)),

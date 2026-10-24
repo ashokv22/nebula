@@ -54,6 +54,17 @@ _GROQ_ERROR_PARAMS = frozenset({
     "temperature", "top_p", "reasoning_effort", "response_format.json_schema",
     "response_format.json_schema.schema",
 })
+_LEAD_CHECK_ACTIONS = frozenset({
+    "REQUEST_INVESTIGATION", "LEAD_HISTORY", "USER_ACTIVITY",
+    "EXTERNAL_API_INSPECTION", "COMPARE_ATTEMPTS",
+})
+_LEAD_CHECK_TITLES = {
+    "REQUEST_INVESTIGATION": "Investigate request",
+    "LEAD_HISTORY": "Review lead history",
+    "USER_ACTIVITY": "Review user activity",
+    "EXTERNAL_API_INSPECTION": "Inspect external API",
+    "COMPARE_ATTEMPTS": "Compare attempts",
+}
 _GROQ_ERROR_MESSAGE_CATEGORIES = frozenset({
     "schema_unsupported_keyword", "schema_not_supported", "invalid_schema",
     "response_format_unsupported", "completion_token_limit", "reasoning_effort",
@@ -231,12 +242,150 @@ def _lead_groq_json_schema() -> dict:
             if key not in {"title", "default"}
         }
         if expanded.get("type") == "object":
-            properties = expanded.get("properties", {})
-            expanded["required"] = list(properties)
             expanded["additionalProperties"] = False
         return expanded
 
     return expand(schema)
+
+
+def _normalize_lead_claims(value, valid_refs: set[str], timeline: bool = False) -> list:
+    if not isinstance(value, list):
+        return []
+    normalized = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        refs = item.get("evidenceRefs", [])
+        if refs is None:
+            refs = []
+        if not isinstance(refs, list):
+            continue
+        refs = list(dict.fromkeys(
+            ref for ref in refs if isinstance(ref, str) and ref in valid_refs
+        ))[:5]
+        description = item.get("description")
+        event = item.get("event") if timeline else None
+        if not isinstance(description, str) or not description.strip() or not refs:
+            continue
+        if timeline and (not isinstance(event, str) or not event.strip()):
+            continue
+        normalized.append({**item, "description": description, "evidenceRefs": refs})
+    return normalized
+
+
+def _normalize_lead_ai_output(parsed, context: str) -> dict:
+    if not isinstance(parsed, dict):
+        return parsed
+    try:
+        context_data = json.loads(context)
+    except (TypeError, json.JSONDecodeError):
+        context_data = {}
+    context_evidence = context_data.get("evidence", []) if isinstance(context_data, dict) else []
+    evidence_by_ref = {
+        item["evidenceRef"]: item for item in context_evidence
+        if isinstance(item, dict) and isinstance(item.get("evidenceRef"), str)
+    } if isinstance(context_evidence, list) else {}
+    valid_refs = set(evidence_by_ref)
+
+    output = dict(parsed)
+    if not isinstance(output.get("narrative"), str):
+        output["narrative"] = ""
+    for key in ("latestObservedActivity", "currentStage"):
+        if output.get(key) is not None and not isinstance(output[key], str):
+            output[key] = None
+    for key in ("summaryEvidenceRefs", "stageEvidenceRefs"):
+        refs = output.get(key)
+        if not isinstance(refs, list):
+            refs = []
+        output[key] = list(dict.fromkeys(
+            ref for ref in refs if isinstance(ref, str) and ref in valid_refs
+        ))[:5]
+    if not output.get("summaryEvidenceRefs"):
+        output["narrative"] = ""
+        output["latestObservedActivity"] = None
+        output["confidence"] = None
+    if not output.get("stageEvidenceRefs"):
+        output["currentStage"] = None
+
+    for key in ("journeyTimeline", "findingsAndAnomalies", "recommendedNextSteps", "limitations"):
+        if not isinstance(output.get(key), list):
+            output[key] = []
+    output["limitations"] = [
+        limitation for limitation in output["limitations"]
+        if isinstance(limitation, str)
+    ]
+    output["journeyTimeline"] = _normalize_lead_claims(
+        output.get("journeyTimeline"), valid_refs, timeline=True,
+    )
+    output["findingsAndAnomalies"] = _normalize_lead_claims(
+        output.get("findingsAndAnomalies"), valid_refs,
+    )
+    output["recommendedNextSteps"] = _normalize_lead_claims(
+        output.get("recommendedNextSteps"), valid_refs,
+    )
+    root_cause = output.get("rootCauseAssessment")
+    if isinstance(root_cause, dict):
+        root_cause = dict(root_cause)
+        for key in ("observedFacts", "possibleCauses"):
+            if root_cause.get(key) is None:
+                root_cause[key] = []
+            root_cause[key] = _normalize_lead_claims(root_cause.get(key), valid_refs)
+        output["rootCauseAssessment"] = (
+            root_cause
+            if root_cause["observedFacts"] or root_cause["possibleCauses"]
+            else None
+        )
+    elif root_cause is not None:
+        output["rootCauseAssessment"] = None
+
+    checks = output.get("suggestedChecks")
+    if not isinstance(checks, list):
+        checks = []
+    normalized_checks = []
+    for proposal in checks:
+        if not isinstance(proposal, dict):
+            continue
+        if set(proposal) - {"action", "title", "reason", "priority", "evidenceRefs"}:
+            continue
+        action = proposal.get("action")
+        if not isinstance(action, str) or action not in _LEAD_CHECK_ACTIONS:
+            continue
+        refs = proposal.get("evidenceRefs")
+        refs = refs if isinstance(refs, list) else []
+        refs = list(dict.fromkeys(
+            ref for ref in refs if isinstance(ref, str) and ref in valid_refs
+        ))[:3]
+        if not refs:
+            continue
+        if action in {"REQUEST_INVESTIGATION", "EXTERNAL_API_INSPECTION"} and not any(
+            evidence_by_ref[ref].get("hasRequestId") for ref in refs
+        ):
+            continue
+        if action == "USER_ACTIVITY" and not any(
+            evidence_by_ref[ref].get("hasUsername") for ref in refs
+        ):
+            continue
+        title = proposal.get("title")
+        reason = proposal.get("reason")
+        priority = proposal.get("priority")
+        normalized_checks.append({
+            "action": action,
+            "title": title.strip() if isinstance(title, str) and title.strip()
+            else _LEAD_CHECK_TITLES[action],
+            "reason": reason if isinstance(reason, str) else "",
+            "priority": priority if isinstance(priority, str)
+            and priority in {"high", "medium", "low"} else "low",
+            "evidenceRefs": refs[:3],
+        })
+    output["suggestedChecks"] = normalized_checks
+    output["confidence"] = (
+        output.get("confidence")
+        if isinstance(output.get("confidence"), str)
+        and output["confidence"] in {"high", "medium", "low"}
+        else None
+    )
+    output["model"] = GROQ_MODEL
+    return output
 
 
 def _lead_response_shape(value, depth: int = 0, budget: list[int] | None = None) -> dict:
@@ -683,8 +832,11 @@ async def call_lead_groq(context: str) -> dict:
                     "not mean a lead is stuck. When identifierCorrelation is ambiguous, treat "
                     "each alias-associated set of evidence as a separate candidate and never "
                     "combine claims across aliases. State uncertainty and limitations. Output only "
-                    "the JSON object matching the supplied schema, with exactly its keys and types. "
-                    "Every evidenceRefs value must come from supplied evidence. The narrative and "
+                    "the JSON object matching the supplied schema; use only its keys and types. "
+                    "Every evidenceRefs value must come from supplied evidence. Optional strings "
+                    "may be omitted or null when unavailable; optional arrays may be omitted, "
+                    "null, or empty. Do not invent confidence, claims, events, or root causes. "
+                    "The narrative and "
                     "latestObservedActivity cite through summaryEvidenceRefs; currentStage is "
                     "allowed only when supported by stageEvidenceRefs; recommendedNextSteps cite "
                     "their evidenceRefs. Use empty arrays for unavailable evidence; summaryEvidenceRefs and "
@@ -697,10 +849,12 @@ async def call_lead_groq(context: str) -> dict:
                     "request ID; USER_ACTIVITY requires evidence with a username; LEAD_HISTORY "
                     "and COMPARE_ATTEMPTS use the lead context. Do not add fields, infer IDs, or "
                     "fabricate supporting evidence. The server constructs navigation context from "
-                    "validated evidence. Every suggestedChecks item MUST include all required "
-                    "schema fields: title, action, priority, reason, and evidenceRefs. The title "
-                    "must be a short, meaningful, human-readable label appropriate for a Horizon "
-                    "quick action. Do not omit title even when other fields are present. Use the "
+                    "validated evidence. Include action, title, priority, reason, and evidenceRefs "
+                    "for each suggested check when available. Use the action allowlist; missing "
+                    "title, reason, or evidenceRefs are normalized safely, and checks without "
+                    "required supporting evidence are discarded. Make title a short, meaningful, "
+                    "human-readable label appropriate for a Horizon quick action; a missing title "
+                    "is generated from the validated action. Use the "
                     "schema below as instructions only; do not output "
                     "the schema, a wrapper containing the schema, or any text outside the single "
                     "response object. Schema: "
@@ -712,14 +866,7 @@ async def call_lead_groq(context: str) -> dict:
                 "content": "Analyze this redacted evidence only:\n" + context,
             },
         ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "lead_intelligence",
-                "strict": True,
-                "schema": lead_schema,
-            },
-        },
+        "response_format": {"type": "json_object"},
         "reasoning_effort": "low",
         "max_completion_tokens": 1800,
     }
@@ -817,7 +964,8 @@ async def call_lead_groq(context: str) -> dict:
         if isinstance(parsed, dict) else []
     )
     try:
-        return LeadIntelligenceModel.model_validate(parsed).model_dump()
+        normalized = _normalize_lead_ai_output(parsed, context)
+        return LeadIntelligenceModel.model_validate(normalized).model_dump()
     except ValidationError as exc:
         paths, error_types, suggested_errors = _validation_diagnostics(exc)
         _lead_ai_diagnostic(

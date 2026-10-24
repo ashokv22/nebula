@@ -49,7 +49,14 @@ class LeadIntelligenceTests(unittest.TestCase):
             patch("lens.analyzer.httpx.AsyncClient", return_value=client),
             patch.dict("os.environ", {"API_TOKEN": "synthetic-token"}),
         ):
-            return asyncio.run(analyzer.call_lead_groq("{}"))
+            context = json.dumps({
+                "evidence": [{
+                    "evidenceRef": "evidence-1",
+                    "hasRequestId": True,
+                    "hasUsername": True,
+                }],
+            })
+            return asyncio.run(analyzer.call_lead_groq(context))
 
     @staticmethod
     def valid_lead_model_output():
@@ -131,7 +138,13 @@ class LeadIntelligenceTests(unittest.TestCase):
             patch("lens.analyzer.httpx.AsyncClient", return_value=client),
             patch.dict("os.environ", {"API_TOKEN": "synthetic-token"}),
         ):
-            result = asyncio.run(analyzer.call_lead_groq("{}"))
+            result = asyncio.run(analyzer.call_lead_groq(json.dumps({
+                "evidence": [{
+                    "evidenceRef": "evidence-1",
+                    "hasRequestId": True,
+                    "hasUsername": True,
+                }],
+            })))
 
         sent = client.post.await_args.kwargs["json"]
         system_prompt = sent["messages"][0]["content"]
@@ -143,21 +156,139 @@ class LeadIntelligenceTests(unittest.TestCase):
         self.assertIn(schema, system_prompt)
         self.assertIn("do not output the schema", system_prompt)
         self.assertIn("single response object", system_prompt)
-        self.assertIn("Every suggestedChecks item MUST include", system_prompt)
-        self.assertIn("title, action, priority, reason, and evidenceRefs", system_prompt)
+        self.assertIn("Include action, title, priority, reason, and evidenceRefs", system_prompt)
+        self.assertIn("missing title is generated from the validated action", system_prompt)
         self.assertIn("Horizon quick action", system_prompt)
         response_format = sent["response_format"]
-        self.assertEqual(response_format["type"], "json_schema")
-        self.assertTrue(response_format["json_schema"]["strict"])
-        self.assertEqual(response_format["json_schema"]["schema"], analyzer._lead_groq_json_schema())
-        self.assertEqual(response_format["json_schema"]["schema"]["type"], "object")
+        self.assertEqual(response_format, {"type": "json_object"})
         self.assertEqual(sent["model"], config.GROQ_MODEL)
         self.assertEqual(sent["reasoning_effort"], "low")
         self.assertEqual(sent["max_completion_tokens"], 1800)
         self.assertNotIn("temperature", sent)
         self.assertEqual(result["journeyTimeline"][0]["description"], "A candidate event was observed.")
 
-    def test_lead_groq_rejects_suggested_checks_missing_title(self):
+    def test_lead_ai_normalization_handles_null_missing_and_unsafe_checks(self):
+        context = json.dumps({
+            "evidence": [{
+                "evidenceRef": "evidence-valid",
+                "hasRequestId": True,
+                "hasUsername": True,
+            }],
+        })
+        raw = {
+            "narrative": None,
+            "latestObservedActivity": None,
+            "currentStage": None,
+            "summaryEvidenceRefs": None,
+            "stageEvidenceRefs": None,
+            "confidence": "high",
+            "journeyTimeline": None,
+            "findingsAndAnomalies": None,
+            "rootCauseAssessment": {},
+            "suggestedChecks": [
+                {
+                    "action": "REQUEST_INVESTIGATION",
+                    "evidenceRefs": ["evidence-valid", "not-in-context"],
+                    "priority": None,
+                    "reason": None,
+                },
+                {
+                    "action": "USER_ACTIVITY",
+                    "evidenceRefs": ["not-in-context"],
+                },
+                {
+                    "action": "UNSUPPORTED_DESTINATION",
+                    "evidenceRefs": ["evidence-valid"],
+                },
+                {
+                    "action": "LEAD_HISTORY",
+                    "evidenceRefs": None,
+                },
+                {
+                    "action": "LEAD_HISTORY",
+                    "evidenceRefs": ["evidence-valid"],
+                    "destination": "unsafe://navigation",
+                },
+            ],
+            "recommendedNextSteps": None,
+            "limitations": None,
+        }
+        result = analyzer._normalize_lead_ai_output(raw, context)
+        validated = schemas.LeadIntelligenceModel.model_validate(result)
+        self.assertEqual(validated.narrative, "")
+        self.assertIsNone(validated.confidence)
+        self.assertEqual(validated.journeyTimeline, [])
+        self.assertIsNone(validated.rootCauseAssessment)
+        self.assertEqual(validated.recommendedNextSteps, [])
+        self.assertEqual(validated.limitations, [])
+        self.assertEqual(len(validated.suggestedChecks), 1)
+        self.assertEqual(validated.suggestedChecks[0].title, "Investigate request")
+        self.assertEqual(validated.suggestedChecks[0].reason, "")
+        self.assertEqual(validated.suggestedChecks[0].priority, "low")
+        self.assertEqual(validated.suggestedChecks[0].evidenceRefs, ["evidence-valid"])
+
+    def test_lead_ai_normalization_discards_unreferenced_claims_and_empty_output_is_valid(self):
+        context = json.dumps({"evidence": [{"evidenceRef": "evidence-1"}]})
+        normalized = analyzer._normalize_lead_ai_output({
+            "narrative": "Unsupported summary",
+            "summaryEvidenceRefs": ["unknown-ref"],
+            "journeyTimeline": [{
+                "event": "Unsubstantiated event",
+                "description": "No evidence exists.",
+                "evidenceRefs": ["unknown-ref"],
+            }],
+            "findingsAndAnomalies": [{
+                "description": "Unsubstantiated finding",
+                "evidenceRefs": [],
+            }],
+            "recommendedNextSteps": [{
+                "description": "Unsubstantiated step",
+                "evidenceRefs": None,
+            }],
+        }, context)
+        validated = schemas.LeadIntelligenceModel.model_validate(normalized)
+        self.assertEqual(validated.narrative, "")
+        self.assertEqual(validated.summaryEvidenceRefs, [])
+        self.assertIsNone(validated.confidence)
+        self.assertIsNone(validated.rootCauseAssessment)
+        self.assertEqual(validated.journeyTimeline, [])
+        self.assertEqual(validated.findingsAndAnomalies, [])
+        self.assertEqual(validated.recommendedNextSteps, [])
+
+        empty = schemas.LeadIntelligenceModel.model_validate(
+            analyzer._normalize_lead_ai_output({}, context)
+        )
+        self.assertEqual(empty.narrative, "")
+        self.assertEqual(empty.journeyTimeline, [])
+        self.assertEqual(empty.suggestedChecks, [])
+        self.assertIsNone(empty.confidence)
+
+    def test_lead_ai_normalization_discards_malformed_optional_fields(self):
+        normalized = analyzer._normalize_lead_ai_output({
+            "narrative": 17,
+            "latestObservedActivity": [],
+            "currentStage": {},
+            "summaryEvidenceRefs": "invalid",
+            "stageEvidenceRefs": None,
+            "confidence": {"unsupported": "value"},
+            "journeyTimeline": "invalid",
+            "findingsAndAnomalies": None,
+            "rootCauseAssessment": [],
+            "suggestedChecks": "invalid",
+            "recommendedNextSteps": None,
+            "limitations": [None, 3, "history is incomplete"],
+        }, json.dumps({"evidence": []}))
+        validated = schemas.LeadIntelligenceModel.model_validate(normalized)
+        self.assertEqual(validated.narrative, "")
+        self.assertIsNone(validated.latestObservedActivity)
+        self.assertIsNone(validated.currentStage)
+        self.assertIsNone(validated.confidence)
+        self.assertIsNone(validated.rootCauseAssessment)
+        self.assertEqual(validated.journeyTimeline, [])
+        self.assertEqual(validated.suggestedChecks, [])
+        self.assertEqual(validated.limitations, ["history is incomplete"])
+
+    def test_lead_groq_generates_title_for_suggested_check_missing_title(self):
         output = self.valid_lead_model_output()
         output["suggestedChecks"] = [{
             "action": "REQUEST_INVESTIGATION",
@@ -170,15 +301,11 @@ class LeadIntelligenceTests(unittest.TestCase):
             "reason": "Review the lead history.",
             "evidenceRefs": ["evidence-1"],
         }]
-        with self.assertLogs("lens.analyzer", level="WARNING") as captured:
-            with self.assertRaises(HTTPException):
-                self.call_lead_groq_with_content(json.dumps(output))
-
-        diagnostic = captured.records[0].lead_ai_diagnostic
-        self.assertEqual(diagnostic["stage"], "pydantic_validation")
-        self.assertIn("suggestedChecks.0.title", diagnostic["field_paths"])
-        self.assertIn("suggestedChecks.1.title", diagnostic["field_paths"])
-        self.assertEqual(diagnostic["invalid_suggested_check_count"], 2)
+        result = self.call_lead_groq_with_content(json.dumps(output))
+        self.assertEqual(
+            [check["title"] for check in result["suggestedChecks"]],
+            ["Investigate request", "Review lead history"],
+        )
 
     def test_lead_provider_schema_enforces_object_roots_and_complete_nested_shapes(self):
         schema = analyzer._lead_groq_json_schema()
@@ -191,7 +318,7 @@ class LeadIntelligenceTests(unittest.TestCase):
                 self.assertNotIn("$ref", node)
                 if node.get("type") == "object":
                     properties = node.get("properties", {})
-                    self.assertEqual(set(node.get("required", [])), set(properties))
+                    self.assertTrue(set(node.get("required", [])).issubset(properties))
                     self.assertIs(node.get("additionalProperties"), False)
                 for value in node.values():
                     assert_strict_objects(value)

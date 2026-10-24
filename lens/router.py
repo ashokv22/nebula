@@ -79,15 +79,11 @@ async def analyze_lead(
                 "latestActivityEvidence": [],
                 "currentStage": None,
                 "stageEvidence": [],
-                "confidence": "low",
+                "confidence": None,
             },
             "journeyTimeline": [],
             "findingsAndAnomalies": [],
-            "rootCauseAssessment": {
-                "observedFacts": [],
-                "possibleCauses": [],
-                "confidence": "low",
-            },
+            "rootCauseAssessment": None,
             "suggestedChecks": [],
             "recommendedNextSteps": [],
             "limitations": list(dict.fromkeys(

@@ -86,47 +86,47 @@ class LeadCheckProposal(BaseModel):
         "EXTERNAL_API_INSPECTION",
         "COMPARE_ATTEMPTS",
     ]
-    title: str
-    reason: str
-    priority: Literal["high", "medium", "low"]
-    evidenceRefs: list[str] = Field(min_length=1, max_length=3)
+    title: str = ""
+    reason: str = ""
+    priority: Literal["high", "medium", "low"] = "low"
+    evidenceRefs: list[str] = Field(default_factory=list, max_length=3)
 
     model_config = {"extra": "forbid"}
 
 
 class LeadClaim(BaseModel):
-    description: str
-    evidenceRefs: list[str] = Field(min_length=1, max_length=5)
+    description: str = ""
+    evidenceRefs: list[str] = Field(default_factory=list, max_length=5)
 
     model_config = {"extra": "forbid"}
 
 
 class LeadTimelineClaim(LeadClaim):
-    event: str
+    event: str = ""
 
 
 class LeadRootCause(BaseModel):
-    observedFacts: list[LeadClaim]
-    possibleCauses: list[LeadClaim]
-    confidence: Literal["high", "medium", "low"]
+    observedFacts: list[LeadClaim] = Field(default_factory=list)
+    possibleCauses: list[LeadClaim] = Field(default_factory=list)
+    confidence: Literal["high", "medium", "low"] | None = None
 
     model_config = {"extra": "forbid"}
 
 
 class LeadIntelligenceModel(BaseModel):
-    narrative: str
+    narrative: str = ""
     latestObservedActivity: str | None = None
     currentStage: str | None = None
     summaryEvidenceRefs: list[str] = Field(default_factory=list, max_length=5)
     stageEvidenceRefs: list[str] = Field(default_factory=list, max_length=5)
-    confidence: Literal["high", "medium", "low"]
-    journeyTimeline: list[LeadTimelineClaim]
-    findingsAndAnomalies: list[LeadClaim]
-    rootCauseAssessment: LeadRootCause
-    suggestedChecks: list[LeadCheckProposal] = Field(max_length=3)
-    recommendedNextSteps: list[LeadClaim]
-    limitations: list[str]
-    model: Literal["openai/gpt-oss-20b"]
+    confidence: Literal["high", "medium", "low"] | None = None
+    journeyTimeline: list[LeadTimelineClaim] = Field(default_factory=list)
+    findingsAndAnomalies: list[LeadClaim] = Field(default_factory=list)
+    rootCauseAssessment: LeadRootCause | None = None
+    suggestedChecks: list[LeadCheckProposal] = Field(default_factory=list, max_length=3)
+    recommendedNextSteps: list[LeadClaim] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    model: Literal["openai/gpt-oss-20b"] = "openai/gpt-oss-20b"
 
     model_config = {"extra": "forbid"}
 
@@ -140,15 +140,15 @@ class LeadEvidenceSupport(BaseModel):
 class LeadSummaryResponse(BaseModel):
     narrative: str
     latestObservedActivity: str | None
-    latestActivityEvidence: list[LeadEvidenceSupport]
+    latestActivityEvidence: list[LeadEvidenceSupport] = Field(default_factory=list)
     currentStage: str | None
-    stageEvidence: list[LeadEvidenceSupport]
-    confidence: Literal["high", "medium", "low"]
+    stageEvidence: list[LeadEvidenceSupport] = Field(default_factory=list)
+    confidence: Literal["high", "medium", "low"] | None = None
 
 
 class LeadClaimResponse(BaseModel):
     description: str
-    supportingEvidence: list[LeadEvidenceSupport]
+    supportingEvidence: list[LeadEvidenceSupport] = Field(default_factory=list)
 
 
 class LeadTimelineResponse(LeadClaimResponse):
@@ -156,9 +156,9 @@ class LeadTimelineResponse(LeadClaimResponse):
 
 
 class LeadRootCauseResponse(BaseModel):
-    observedFacts: list[LeadClaimResponse]
-    possibleCauses: list[LeadClaimResponse]
-    confidence: Literal["high", "medium", "low"]
+    observedFacts: list[LeadClaimResponse] = Field(default_factory=list)
+    possibleCauses: list[LeadClaimResponse] = Field(default_factory=list)
+    confidence: Literal["high", "medium", "low"] | None = None
 
 
 class LeadSuggestedCheckResponse(BaseModel):
@@ -177,10 +177,10 @@ class LeadSuggestedCheckResponse(BaseModel):
 
 class LeadIntelligenceResponse(BaseModel):
     leadSummary: LeadSummaryResponse
-    journeyTimeline: list[LeadTimelineResponse]
-    findingsAndAnomalies: list[LeadClaimResponse]
-    rootCauseAssessment: LeadRootCauseResponse
-    suggestedChecks: list[LeadSuggestedCheckResponse]
-    recommendedNextSteps: list[LeadClaimResponse]
-    limitations: list[str]
+    journeyTimeline: list[LeadTimelineResponse] = Field(default_factory=list)
+    findingsAndAnomalies: list[LeadClaimResponse] = Field(default_factory=list)
+    rootCauseAssessment: LeadRootCauseResponse | None = None
+    suggestedChecks: list[LeadSuggestedCheckResponse] = Field(default_factory=list)
+    recommendedNextSteps: list[LeadClaimResponse] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
     model: Literal["openai/gpt-oss-20b"]
