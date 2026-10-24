@@ -28,6 +28,12 @@ curl -s 'http://127.0.0.1:8000/requests/39c1Yjae?minutes=1440' | jq '{request_id
 curl -s 'http://127.0.0.1:8000/errors/recent?minutes=60&limit=20' | jq '{count,errors:[.errors[]|{timestamp,request_id,exception,message:(.message|split("\n")[0])}]}'
 curl -s http://127.0.0.1:8000/analyze -H 'Content-Type: application/json' -d '{"requestId":"Qwk449Um","minutes":1440}' | jq .
 curl -s http://127.0.0.1:8000/analyze -H 'Content-Type: application/json' -d '{"text":"ERROR external API failed with status 502"}' | jq .
+curl -s 'http://127.0.0.1:8000/leads/LEAD-123/submissions?env=uat&days=7' \
+  -H 'X-Request-Investigation-Token: YOUR_TOKEN' | jq .
+curl -s 'http://127.0.0.1:8000/leads/LEAD-123/submissions/SUBMISSION_ID?env=uat' \
+  -H 'X-Request-Investigation-Token: YOUR_TOKEN' | jq .
+curl -sS 'http://127.0.0.1:8000/leads/LEAD-123/submissions/SUBMISSION_ID?env=prod&download=true' \
+  -H 'X-Request-Investigation-Token: YOUR_TOKEN' -OJ
 ```
 
 Docs: http://127.0.0.1:8000/docs
@@ -51,3 +57,9 @@ send `"forceRefresh": true` to bypass the cache.
 For `/analyze` request-ID investigations, the optional
 `X-Request-Investigation-Token` header follows the same protection as the
 request timeline endpoint. `minutes` defaults to 60 and is limited to 1-1440.
+
+Lead submission endpoints query Loki for
+`[FeignKeilodofinClient#saveLoan]` entries and verify `partnerLoanId` against
+the requested lead ID. The submissions list defaults to a seven-day lookback
+(maximum 30 days) and returns metadata only; use the individual submission
+endpoint for a payload preview or `download=true` to save the exact JSON.

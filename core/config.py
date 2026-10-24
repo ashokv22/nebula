@@ -1,8 +1,8 @@
 import os
 from typing import Literal
 
-LOKI_URL = os.getenv("LOKI_URL", "http://127.0.0.1:13100").rstrip("/")
-REQUEST_INVESTIGATION_TOKEN = os.getenv("REQUEST_INVESTIGATION_TOKEN")
+LOKI_URL = os.getenv("LOKI_URL", "http://127.0.0.1:3100").rstrip("/")
+REQUEST_INVESTIGATION_TOKEN = ""
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "openai/gpt-oss-20b"
 ANALYSIS_MAX_EVENTS = int(os.getenv("ANALYSIS_MAX_EVENTS", "40"))

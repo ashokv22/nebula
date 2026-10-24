@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi.responses import Response
 
 from core.config import (
     ANALYSIS_CACHE,
@@ -24,6 +25,7 @@ from lens.service import (
     enrich_recent_errors,
     normalize_username,
 )
+from lens.submissions import get_submission, list_submissions
 
 router = APIRouter()
 
@@ -160,3 +162,46 @@ async def recent_errors(
     return {"environment": environment, "count": len(enriched),
             "truncated_possible": truncated_possible,
             "count_is_exact": not truncated_possible, "errors": enriched}
+
+@router.get("/leads/{lead_id}/submissions")
+async def lead_submissions(
+    lead_id: str,
+    days: Annotated[int, Query(ge=1, le=30)] = 7,
+    access_token: Annotated[str | None, Header(alias="X-Request-Investigation-Token")] = None,
+    environment: Annotated[Literal["uat", "prod"], Query(alias="env")] = "uat",
+):
+    if not lead_id.strip():
+        raise HTTPException(status_code=400, detail="Lead ID must not be empty")
+    authorize_request_investigation(access_token)
+    return await list_submissions(lead_id, days, environment)
+
+
+@router.get("/leads/{lead_id}/submissions/{submission_id}")
+async def lead_submission_payload(
+    lead_id: str,
+    submission_id: str,
+    download: bool = False,
+    access_token: Annotated[str | None, Header(alias="X-Request-Investigation-Token")] = None,
+    environment: Annotated[Literal["uat", "prod"], Query(alias="env")] = "uat",
+):
+    if not lead_id.strip():
+        raise HTTPException(status_code=400, detail="Lead ID must not be empty")
+    authorize_request_investigation(access_token)
+    submission = await get_submission(lead_id, submission_id, environment)
+    if download:
+        return Response(
+            content=submission["payload"],
+            media_type="application/json",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="submission-{submission_id}.json"'
+                )
+            },
+        )
+    return {
+        "lead_id": lead_id,
+        "submission_id": submission["submission_id"],
+        "timestamp": submission["timestamp"],
+        "payload_size": submission["payload_size"],
+        "payload": json.loads(submission["payload"]),
+    }
