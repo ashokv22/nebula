@@ -67,6 +67,12 @@ def _lead_ai_diagnostic(stage: str, **details) -> None:
         value = details.get(key)
         if isinstance(value, str) and value in _ROOT_TYPE_NAMES:
             fields[key] = value
+    response_chars = details.get("response_chars")
+    if type(response_chars) is int and 0 <= response_chars <= 1_000_000:
+        fields["response_chars"] = response_chars
+    response_shape = details.get("response_shape")
+    if isinstance(response_shape, dict):
+        fields["response_shape"] = response_shape
     if type(details.get("json_double_encoded")) is bool:
         fields["json_double_encoded"] = details["json_double_encoded"]
     root_keys = details.get("root_keys")
@@ -128,6 +134,80 @@ def _completion_metadata(data: dict, http_status: int) -> dict:
         "completion_tokens": usage.get("completion_tokens") if type(usage.get("completion_tokens")) is int else None,
         "total_tokens": usage.get("total_tokens") if type(usage.get("total_tokens")) is int else None,
     }
+
+
+def _lead_groq_json_schema() -> dict:
+    schema = LeadIntelligenceModel.model_json_schema()
+    definitions = schema.pop("$defs", {})
+
+    def expand(node):
+        if isinstance(node, list):
+            return [expand(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        reference = node.get("$ref")
+        if reference:
+            definition_name = reference.rsplit("/", 1)[-1]
+            return expand(definitions[definition_name])
+        expanded = {
+            key: expand(value)
+            for key, value in node.items()
+            if key not in {"title", "default"}
+        }
+        if expanded.get("type") == "object":
+            properties = expanded.get("properties", {})
+            expanded["required"] = list(properties)
+            expanded["additionalProperties"] = False
+        return expanded
+
+    return expand(schema)
+
+
+def _lead_response_shape(value, depth: int = 0, budget: list[int] | None = None) -> dict:
+    if budget is None:
+        budget = [80]
+    if budget[0] <= 0:
+        return {"type": "truncated"}
+    budget[0] -= 1
+
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "bool"}
+    if isinstance(value, dict):
+        known_keys = sorted(key for key in value if isinstance(key, str) and key in _LEAD_FIELDS)
+        shape = {
+            "type": "dict",
+            "known_keys": known_keys,
+            "unknown_key_count": min(1_000_000, len(value) - len(known_keys)),
+        }
+        if depth < 4:
+            shape["fields"] = {
+                key: _lead_response_shape(value[key], depth + 1, budget)
+                for key in known_keys[:20]
+            }
+        elif known_keys:
+            shape["truncated"] = True
+        return shape
+    if isinstance(value, list):
+        shape = {"type": "list", "length": min(1_000_000, len(value))}
+        if depth < 4 and value:
+            shape["items"] = [
+                _lead_response_shape(item, depth + 1, budget)
+                for item in value[:3]
+            ]
+            if len(value) > 3:
+                shape["items_truncated"] = True
+        elif value:
+            shape["truncated"] = True
+        return shape
+    if isinstance(value, str):
+        return {"type": "str"}
+    if isinstance(value, int):
+        return {"type": "int"}
+    if isinstance(value, float):
+        return {"type": "float"}
+    return {"type": "other"}
 
 
 def _validation_diagnostics(exc: ValidationError) -> tuple[list[str], list[str], int]:
@@ -508,8 +588,9 @@ async def call_lead_groq(context: str) -> dict:
     token = os.getenv("API_TOKEN")
     if not token:
         raise HTTPException(status_code=503, detail="AI analysis is unavailable: API_TOKEN is not configured")
+    lead_schema = _lead_groq_json_schema()
     lead_output_schema = json.dumps(
-        LeadIntelligenceModel.model_json_schema(),
+        lead_schema,
         ensure_ascii=True,
         separators=(",", ":"),
     )
@@ -553,7 +634,14 @@ async def call_lead_groq(context: str) -> dict:
                 "content": "Analyze this redacted evidence only:\n" + context,
             },
         ],
-        "response_format": {"type": "json_object"},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "lead_intelligence",
+                "strict": True,
+                "schema": lead_schema,
+            },
+        },
         "reasoning_effort": "low",
         "max_completion_tokens": 1800,
     }
@@ -665,5 +753,7 @@ async def call_lead_groq(context: str) -> dict:
             validation_input_type=parsed_root_type,
             root_keys=root_keys,
             json_double_encoded=json_double_encoded,
+            response_chars=len(content),
+            response_shape=_lead_response_shape(parsed),
         )
         raise HTTPException(status_code=502, detail="Groq returned invalid Lead Intelligence") from exc

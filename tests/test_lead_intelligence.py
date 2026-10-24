@@ -136,18 +136,46 @@ class LeadIntelligenceTests(unittest.TestCase):
         sent = client.post.await_args.kwargs["json"]
         system_prompt = sent["messages"][0]["content"]
         schema = json.dumps(
-            schemas.LeadIntelligenceModel.model_json_schema(),
+            analyzer._lead_groq_json_schema(),
             ensure_ascii=True,
             separators=(",", ":"),
         )
         self.assertIn(schema, system_prompt)
         self.assertIn("do not output the schema", system_prompt)
         self.assertIn("single response object", system_prompt)
+        response_format = sent["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertTrue(response_format["json_schema"]["strict"])
+        self.assertEqual(response_format["json_schema"]["schema"], analyzer._lead_groq_json_schema())
+        self.assertEqual(response_format["json_schema"]["schema"]["type"], "object")
         self.assertEqual(result["journeyTimeline"][0]["description"], "A candidate event was observed.")
+
+    def test_lead_provider_schema_enforces_object_roots_and_complete_nested_shapes(self):
+        schema = analyzer._lead_groq_json_schema()
+
+        def assert_strict_objects(node):
+            if isinstance(node, list):
+                for item in node:
+                    assert_strict_objects(item)
+            elif isinstance(node, dict):
+                self.assertNotIn("$ref", node)
+                if node.get("type") == "object":
+                    properties = node.get("properties", {})
+                    self.assertEqual(set(node.get("required", [])), set(properties))
+                    self.assertIs(node.get("additionalProperties"), False)
+                for value in node.values():
+                    assert_strict_objects(value)
+
+        self.assertEqual(schema["type"], "object")
+        assert_strict_objects(schema)
 
     def test_lead_groq_reports_array_double_encoded_and_invalid_roots(self):
         cases = (
-            (json.dumps([]), "list", False),
+            (json.dumps([{
+                "narrative": "SYNTHETIC_PRIVATE_RESPONSE_VALUE",
+                "suggestedChecks": [{"action": "PRIVATE_ACTION"}],
+                "UNRECOGNIZED_PRIVATE_KEY": "PRIVATE_VALUE",
+            }]), "list", False),
             (json.dumps(json.dumps(self.valid_lead_model_output())), "str", True),
             (json.dumps(42), "int", False),
         )
@@ -161,6 +189,15 @@ class LeadIntelligenceTests(unittest.TestCase):
                 self.assertEqual(diagnostic["parsed_root_type"], expected_type)
                 self.assertEqual(diagnostic["validation_input_type"], expected_type)
                 self.assertEqual(diagnostic["json_double_encoded"], double_encoded)
+                if expected_type == "list":
+                    message = captured.records[0].getMessage()
+                    self.assertIn('"response_chars":', message)
+                    self.assertIn('"response_shape":{"type":"list","length":1', message)
+                    self.assertIn('"known_keys":["narrative","suggestedChecks"]', message)
+                    self.assertIn('"unknown_key_count":1', message)
+                    self.assertNotIn("SYNTHETIC_PRIVATE_RESPONSE_VALUE", message)
+                    self.assertNotIn("UNRECOGNIZED_PRIVATE_KEY", message)
+                    self.assertNotIn("PRIVATE_VALUE", message)
 
     def test_lead_groq_root_keys_are_limited_to_known_schema_names(self):
         private_key = "CUSTOM_PRIVATE_KEY"
