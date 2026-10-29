@@ -3,9 +3,10 @@ from datetime import datetime, timezone
 
 HEADER = re.compile(
     r"^(?P<timestamp>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}) "
-    r"\[(?P<thread>[^]]+)\] (?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+"
+    r"(?:\[(?P<thread>[^]]+)\] )?"
+    r"(?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+"
     r"\[(?P<request_id>[^,\]]*),(?P<user>[^\]]*)\] "
-    r"\[(?P<pid>[^]]+)\] --- (?P<logger>.*?) : (?P<message>[\s\S]*)$"
+    r"(?:\[(?P<pid>[^]]+)\] )?--- (?P<logger>.*?) : (?P<message>[\s\S]*)$"
 )
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 EXCEPTION = re.compile(r"\b([\w.$]+(?:Exception|Error))\b")
@@ -37,8 +38,8 @@ def parse_entry(ns: str, raw: str) -> dict:
         entry["timestamp"] = datetime.fromtimestamp(int(ns) / 1e9, timezone.utc).isoformat()
         entry["message"] = match.group("message")
     else:
-        entry.update({"level": None, "request_id": None, "user": None, "logger": None, "thread": None,
-                      "message": cleaned})
+        entry.update({"level": None, "request_id": None, "user": None, "logger": None,
+                      "thread": None, "pid": None, "message": cleaned})
     declaration = find_exception_declaration(entry["message"])
     entry["exception"] = declaration.group("class") if declaration else None
     return entry
@@ -146,11 +147,4 @@ def request_marker_metadata(entry: dict, marker: str) -> dict:
 
 
 def request_entry_matches(entry: dict, request_id: str) -> bool:
-    if entry["request_id"] == request_id:
-        return True
-    malformed_header = re.match(
-        r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} \[[^]]+\] \S+\s+"
-        r"\[(?P<request_id>[^,\]]+),",
-        entry["raw"],
-    )
-    return bool(malformed_header and malformed_header.group("request_id") == request_id)
+    return entry.get("request_id") == request_id
